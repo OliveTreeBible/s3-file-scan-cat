@@ -1,0 +1,25 @@
+{
+  "compileOnSave": true,
+  "compilerOptions": {
+    "noImplicitAny": true,
+    "strictNullChecks": true,
+    "moduleResolution": "node",
+    "declaration": true,
+    "strict": true,
+    "lib": ["ES2019"],
+    "module": "commonjs",
+    "target": "ES2019",
+    "outDir": "./lib",
+    "sourceMap": true,
+    "typeRoots": [
+      "node_modules/@types"
+    ],
+    "types": [
+      "node", "moment"
+    ]
+  },
+  "include": [
+    "src/**/*"
+  ],
+  "exclude": ["node_modules", "**/__tests__/*"]
+}
