@@ -34,3 +34,35 @@ export interface AWSS3Config {
     scanner_prefix: string
     destination_prefix: string
 }
+
+export interface PrefixParams {
+    prefix: string
+    partitionStack: string[]
+    bounds: ScannerBounds | undefined
+}
+
+export interface ConcatState {
+    continuationToken: AWS.S3.Types.Token
+    buffer: string
+    fileNumber: number
+}
+
+export interface PrefixEvalResult {
+    keyParams?: PrefixParams
+    partition?: string
+}
+
+export interface GenericMatch {
+    [key: string]: string;
+}
+
+export interface MatchedDate extends GenericMatch {
+    year: string;
+    month: string;
+    day: string;
+}
+
+export interface AWSSecrets {
+    accessKeyId: string
+    secretAccessKey: string
+}

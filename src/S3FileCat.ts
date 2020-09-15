@@ -7,11 +7,7 @@ import { gzip } from 'node-gzip'
 import { mem, MemInfo } from 'node-os-utils'
 import { Logger } from 'typescript-logging'
 
-import { S3FetchLimits, ScannerOptions } from './interfaces/appConfig.interface'
-import {
-    ConcatState, MatchedDate, PrefixEvalResult, PrefixParams
-} from './interfaces/s3Manager.interface'
-import { AWSSecrets } from './interfaces/secretsConfig.interface'
+import { S3FetchLimits, ScannerOptions, ConcatState, MatchedDate, PrefixEvalResult, PrefixParams, AWSSecrets } from './interfaces/scanner.interface'
 import { loggerFactory } from './utils/logger'
 
 const INFINITE_TIMEOUT = 2147483647 // This is actually 24 days but it is also the largest timeout allowed
