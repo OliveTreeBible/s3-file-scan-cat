@@ -18,7 +18,7 @@ type NullableAWSListObjectsOutput = undefined | AWS.S3.ListObjectsV2Output
 type NullableMoment = undefined | moment.Moment
 type NullableString = undefined | string
 
-export class S3FileCat {
+export class S3FileScanCat {
     private _s3: AWS.S3
     private _log: Logger
     private _delimeter: string
