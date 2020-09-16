@@ -1,4 +1,4 @@
-export interface AppConfig {
+export interface ScannerConfig {
     aws: AWSConfig
     scanner: ScannerOptions
 }
