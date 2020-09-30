@@ -1,14 +1,16 @@
-import * as waitUntil from 'async-wait-until'
-import * as AWS from 'aws-sdk'
-import { ListObjectsV2Request } from 'aws-sdk/clients/s3'
-import { error } from 'console'
-import * as moment from 'moment'
-import { gzip } from 'node-gzip'
-import { mem, MemInfo } from 'node-os-utils'
-import { Logger } from 'typescript-logging'
+import * as waitUntil from 'async-wait-until';
+import * as AWS from 'aws-sdk';
+import { ListObjectsV2Request } from 'aws-sdk/clients/s3';
+import { error } from 'console';
+import * as moment from 'moment';
+import { gzip } from 'node-gzip';
+import { mem, MemInfo } from 'node-os-utils';
+import { Logger } from 'typescript-logging';
 
-import { S3FetchLimits, ScannerOptions, ConcatState, MatchedDate, PrefixEvalResult, PrefixParams, AWSSecrets } from './interfaces/scanner.interface'
-import { loggerFactory } from './utils/logger'
+import {
+    AWSSecrets, ConcatState, MatchedDate, PrefixEvalResult, PrefixParams, ScannerOptions
+} from './interfaces/scanner.interface';
+import { loggerFactory } from './utils/logger';
 
 const INFINITE_TIMEOUT = 2147483647 // This is actually 24 days but it is also the largest timeout allowed
 
@@ -34,15 +36,18 @@ export class S3FileScanCat {
     private _s3ObjectsPutTotal: number
     private _isDone: boolean
     private _memInfo: undefined | MemInfo
+    private _minPercentRamFree: number
+    private _objectFetchBatchSize: number
+    private _prefixListObjectsLimit: number
+    private _objectBodyFetchLimit: number
+    private _objectBodyPutLimit: number
+    private _scannerOptions: ScannerOptions
     constructor(
-        private bucket: string,
-        private awsAccess: AWSSecrets,
-        private fetchLimits: S3FetchLimits,
-        private headless: boolean
+        scannerOptions: ScannerOptions,
+        awsAccess: AWSSecrets
     ) {
         this._log = loggerFactory.getLogger('app.partitioner')
         this._delimeter = '/'
-        this.bucket = bucket
         this._keyParams = []
         this._allPrefixes = []
         this._s3BuildPrefixListObjectsProcessCount = 0
@@ -54,6 +59,12 @@ export class S3FileScanCat {
         this._s3ObjectsFetchedTotal = 0
         this._s3ObjectsPutTotal = 0
         this._isDone = false
+        this._minPercentRamFree = 20.0
+        this._objectFetchBatchSize = 100
+        this._prefixListObjectsLimit = 100
+        this._objectBodyFetchLimit = 100
+        this._objectBodyPutLimit = 100
+        this._scannerOptions = scannerOptions
         AWS.config.update({
             region: 'us-east-1',
             accessKeyId: awsAccess.accessKeyId,
@@ -111,20 +122,21 @@ export class S3FileScanCat {
         return 0.0
     }
 
-    async scanAndProcessFiles(srcPrefix: string, destPrefix: string, scannerOptions: ScannerOptions): Promise<void> {
+    async scanAndProcessFiles(bucket: string, srcPrefix: string, destPrefix: string): Promise<void> {
         this._log.trace({
-            msg: `BEGIN scanConcatenateCopy srcPrefix=${srcPrefix}:destPrefix=${destPrefix}:partitionStack=${scannerOptions.partition_stack}`,
+            msg: `BEGIN scanConcatenateCopy srcPrefix=${srcPrefix}:destPrefix=${destPrefix}:partitionStack=${this._scannerOptions.partitionStack}`,
         })
         const destPath = destPrefix
-        const maxFileSizeBytes = scannerOptions.max_file_size_bytes
+
         this._keyParams.push({
+            bucket,
             prefix: srcPrefix,
-            partitionStack: scannerOptions.partition_stack,
-            bounds: scannerOptions.bounds,
+            partitionStack: this._scannerOptions.partitionStack,
+            bounds: this._scannerOptions.bounds,
         })
         while (this._keyParams.length > 0 || this._s3BuildPrefixListObjectsProcessCount > 0) {
             await waitUntil(
-                () => this._s3BuildPrefixListObjectsProcessCount < this.fetchLimits.max_build_prefix_list,
+                () => this._s3BuildPrefixListObjectsProcessCount < this._scannerOptions.limits.maxBuildPrefixList,
                 INFINITE_TIMEOUT
             )
             const keyParam = this._keyParams.shift()
@@ -135,7 +147,7 @@ export class S3FileScanCat {
             while (this._allPrefixes.length > 0) {
                 const prefix = this._allPrefixes.shift()
                 if (prefix) {
-                    this._concatFilesAtPrefix(prefix, srcPrefix, destPath, maxFileSizeBytes, {
+                    this._concatFilesAtPrefix(bucket, prefix, srcPrefix, destPath, {
                         buffer: '',
                         continuationToken: '',
                         fileNumber: 0,
@@ -153,7 +165,7 @@ export class S3FileScanCat {
         this._isDone = true
     }
     _processAtPriorityCanProceed(priority: number): boolean {
-        if (this._memInfo) return this._memInfo.freeMemPercentage - priority * 5 > this.fetchLimits.min_percent_ram_free
+        if (this._memInfo) return this._memInfo.freeMemPercentage - priority * 5 > this._minPercentRamFree
         return false
     }
 
@@ -162,17 +174,17 @@ export class S3FileScanCat {
     }
 
     async _concatFilesAtPrefix(
+        bucket: string,
         prefix: string,
         srcPrefix: string,
         destPrefix: string,
-        maxFileSizeBytes: number,
         concatState: ConcatState
     ): Promise<void> {
         this._log.info({ msg: `BEGIN _concatFilesAtPrefix prefix=${prefix}` })
         const listObjRequest: ListObjectsV2Request = {
-            Bucket: this.bucket,
+            Bucket: bucket,
             Prefix: prefix.endsWith('/') ? prefix : `${prefix}/`,
-            MaxKeys: this.fetchLimits.max_object_fetch,
+            MaxKeys: this._objectFetchBatchSize,
         }
         do {
             if (concatState.continuationToken.length > 0) {
@@ -181,7 +193,7 @@ export class S3FileScanCat {
             await waitUntil(
                 () =>
                     this._processAtPriorityCanProceed(0) &&
-                    this._s3PrefixListObjectsProcessCount < this.fetchLimits.max_prefix_list_objects,
+                    this._s3PrefixListObjectsProcessCount < this._prefixListObjectsLimit,
                 INFINITE_TIMEOUT
             )
             this._s3PrefixListObjectsProcessCount++
@@ -203,7 +215,7 @@ export class S3FileScanCat {
                     let objectBodyPromises: undefined | Promise<AWS.S3.Body>[] = []
                     for (const s3Object of contents) {
                         if (s3Object.Size && s3Object.Key) {
-                            objectBodyPromises.push(this._getObjectBody(s3Object.Key))
+                            objectBodyPromises.push(this._getObjectBody(bucket, s3Object.Key))
                         } else if (s3Object.Size === 0) {
                             this._log.warn({ msg: `S3 Object had zero size ${JSON.stringify(s3Object.Key)}` })
                         } else {
@@ -222,8 +234,9 @@ export class S3FileScanCat {
                         } else {
                             objectBodyStr = objectBody
                         }
-                        if (concatState.buffer.length + objectBodyStr.length > maxFileSizeBytes) {
+                        if (concatState.buffer.length + objectBodyStr.length > this._scannerOptions.limits.maxFileSizeBytes) {
                             this._flushBuffer(
+                                bucket,
                                 concatState.buffer,
                                 prefix,
                                 srcPrefix,
@@ -239,7 +252,7 @@ export class S3FileScanCat {
                         }
                     })
                     if (doneFetching && concatState.buffer.length > 0) {
-                        this._flushBuffer(concatState.buffer, prefix, srcPrefix, destPrefix, concatState.fileNumber++)
+                        this._flushBuffer(bucket, concatState.buffer, prefix, srcPrefix, destPrefix, concatState.fileNumber++)
                         concatState.buffer = ''
                         concatState.continuationToken = ''
                     }
@@ -253,17 +266,17 @@ export class S3FileScanCat {
         this._prefixesProcessedTotal++
     }
 
-    async _getObjectBody(s3Key: AWS.S3.ObjectKey): Promise<AWS.S3.Body> {
+    async _getObjectBody(bucket: string, s3Key: AWS.S3.ObjectKey): Promise<AWS.S3.Body> {
         this._log.trace({ msg: `BEGIN _getObjectBody objectKey=${s3Key}` })
         let body: AWS.S3.Body
         const getObjectRequest: AWS.S3.Types.GetObjectRequest = {
-            Bucket: this.bucket,
+            Bucket: bucket,
             Key: s3Key,
         }
         await waitUntil(
             () =>
                 this._processAtPriorityCanProceed(0) &&
-                this._s3ObjectBodyProcessCount < this.fetchLimits.max_object_body_fetch,
+                this._s3ObjectBodyProcessCount < this._objectBodyFetchLimit,
             INFINITE_TIMEOUT
         )
         this._s3ObjectBodyProcessCount++
@@ -282,24 +295,24 @@ export class S3FileScanCat {
         return body
     }
 
-    async _flushBuffer(buffer: string, prefix: string, srcPrefix: string, destPrefix: string, fileNumber: number) {
+    async _flushBuffer(bucket: string, buffer: string, prefix: string, srcPrefix: string, destPrefix: string, fileNumber: number) {
         this._log.trace({ msg: `BEGIN _flushBuffer destination=${destPrefix}` })
         const fileName = `${prefix.replace(srcPrefix, destPrefix)}/${fileNumber}.json.gz`
-        await this._saveToS3(buffer, fileName)
+        await this._saveToS3(bucket, buffer, fileName)
     }
 
-    async _saveToS3(buffer: string, key: string): Promise<void> {
+    async _saveToS3(bucket: string, buffer: string, key: string): Promise<void> {
         this._log.trace({ msg: `BEGIN _saveToS3 key=${key}` })
         const body = await gzip(buffer)
         const object: AWS.S3.Types.PutObjectRequest = {
             Body: body,
-            Bucket: this.bucket,
+            Bucket: bucket,
             Key: key,
         }
         await waitUntil(
             () =>
                 this._processAtPriorityCanProceed(0) &&
-                this._s3ObjectPutProcessCount < this.fetchLimits.max_object_puts,
+                this._s3ObjectPutProcessCount < this._objectBodyPutLimit,
             INFINITE_TIMEOUT
         )
         this._s3ObjectPutProcessCount++
@@ -326,7 +339,7 @@ export class S3FileScanCat {
             }
 
             const listObjRequest: ListObjectsV2Request = {
-                Bucket: this.bucket,
+                Bucket: keyParams.bucket,
                 Prefix: keyParams.prefix,
                 Delimiter: this._delimeter,
             }
@@ -427,6 +440,7 @@ export class S3FileScanCat {
                     if (keyParams.partitionStack.length > 0) {
                         const partitionStackClone = Object.assign([], keyParams.partitionStack)
                         result.keyParams = {
+                            bucket: keyParams.bucket,
                             prefix: nextPart,
                             partitionStack: partitionStackClone,
                             bounds: keyParams.bounds,

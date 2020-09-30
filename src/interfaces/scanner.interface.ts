@@ -10,19 +10,19 @@ export interface ScannerBounds {
 
 export interface ScannerOptions {
     headless: boolean
-    partition_stack: string[]
-    max_file_size_bytes: number
+    partitionStack: string[]
     bounds?: ScannerBounds
-    fetch_limits: S3FetchLimits
+    limits: ScannerLimits
 }
 
-export interface S3FetchLimits {
-    max_build_prefix_list: number
-    max_prefix_list_objects: number
-    max_object_fetch: number
-    max_object_body_fetch: number
-    max_object_puts: number
-    min_percent_ram_free: number
+export interface ScannerLimits {
+    maxBuildPrefixList: number
+    prefixListObjectsLimit: number
+    objectFetchBatchSize: number
+    objectBodyFetchLimit: number
+    objectBodyPutLimit: number
+    minPercentRamFree: number
+    maxFileSizeBytes: number
 }
 
 export interface AWSConfig {
@@ -31,11 +31,12 @@ export interface AWSConfig {
 
 export interface AWSS3Config {
     bucket: string
-    scanner_prefix: string
-    destination_prefix: string
+    scannerPrefix: string
+    destinationPrefix: string
 }
 
 export interface PrefixParams {
+    bucket: string
     prefix: string
     partitionStack: string[]
     bounds: ScannerBounds | undefined
