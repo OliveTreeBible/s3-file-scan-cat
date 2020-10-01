@@ -37,31 +37,32 @@ Breaking these three sections into two JSON files is recommended.  One files con
 {
   "aws" : {
     "s3": {
-      "bucket": "_bucket-name_",
-      "scanner_prefix": "_prefix-path_",
-      "destination_prefix": "_desintation-path_"
+      "bucket": "bucket-name",
+      "scannerPrefix": "src-prefix",
+      "destinationPrefix": "dest-prefix"
     }
   },
   "scanner": {
-    "headless": false,
-    "partition_stack" : [
-      "year", 
-      "month", 
-      "day", 
-      "..."
+    "logLevel": 4,
+    "partitionStack" : [
+      "year",
+      "month",
+      "day",
+      "part-04",
+      "part-05"
     ],
-    "max_file_size_bytes": 134217728,
-    "fetch_limits" : {
-      "max_build_prefix_list":   60,
-      "max_prefix_list_objects": 100,
-      "max_object_fetch":        500,
-      "max_object_body_fetch":   4000,
-      "max_object_puts":         100,
-      "min_percent_ram_free":    25.0
+    "limits" : {
+      "maxBuildPrefixList":   100,
+      "prefixListObjectsLimit": 100,
+      "objectFetchBatchSize":        200,
+      "objectBodyFetchLimit":   300,
+      "objectBodyPutLimit":         250,
+      "minPercentRamFree":    25.0,
+      "maxFileSizeBytes": 134217728
     },
     "bounds": {
       "startDate": "2020-01-01",
-      "endDate": "2020-01-31"
+      "endDate": "2020-01-01"
     }
   }
 }
@@ -70,21 +71,17 @@ Breaking these three sections into two JSON files is recommended.  One files con
 #### Performing the scan
 
 ```
-import * as fs from 'fs'
+import * as fs from 'fs';
+import { AWSSecrets, S3FileScanCat, ScannerConfig } from 's3-file-scan-cat';
 
-import { AppConfig } from './interfaces/appConfig.interface'
-import { SecretsConfig } from './interfaces/secretsConfig.interface'
-import { S3FileCat } from './S3FileCat'
-import { StatusScreen } from './StatusScreen'
+const scannerConfig = JSON.parse(fs.readFileSync('./config/manager_config.json').toString('utf8')) as ScannerConfig
+const awsSecrets = JSON.parse(fs.readFileSync('./config/private/secrets.json').toString('utf8')).aws as AWSSecrets
 
-const appConfig = JSON.parse(fs.readFileSync('../config/app_config').toString('utf8')) as AppConfig
-const secrets = JSON.parse(fs.readFileSync('../config/private/secrets').toString('utf8')) as SecretsConfig
-
-const s3Manager = new S3FileCat(appConfig.aws.s3.bucket, secrets.aws, appConfig.scanner.fetch_limits, appConfig.scanner.headless)
-s3Manager
-    .scanAndProcessFiles(appConfig.aws.s3.scanner_prefix, appConfig.aws.s3.destination_prefix, appConfig.scanner)
+const s3Scanner = new S3FileScanCat(scannerConfig.scanner, awsSecrets)
+s3Scanner
+    .scanAndProcessFiles(scannerConfig.aws.s3.bucket, scannerConfig.aws.s3.scannerPrefix, scannerConfig.aws.s3.destinationPrefix)
     .then(() => {
-        if (headlessMode) process.exit(0)
+        process.exit(0)
     })
     .catch((error) => {
         console.error(`Failed: ${error}`)
