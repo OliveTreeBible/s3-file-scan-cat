@@ -1,3 +1,5 @@
+import { LogLevel } from 'typescript-logging'
+
 export interface ScannerConfig {
     aws: AWSConfig
     scanner: ScannerOptions
@@ -9,10 +11,15 @@ export interface ScannerBounds {
 }
 
 export interface ScannerOptions {
-    headless: boolean
+    logOptions?: LoggerOptions
     partitionStack: string[]
     bounds?: ScannerBounds
     limits: ScannerLimits
+}
+
+export interface LoggerOptions {
+    logLevel: LogLevel
+    logGroupingPattern: RegExp
 }
 
 export interface ScannerLimits {
@@ -54,13 +61,13 @@ export interface PrefixEvalResult {
 }
 
 export interface GenericMatch {
-    [key: string]: string;
+    [key: string]: string
 }
 
 export interface MatchedDate extends GenericMatch {
-    year: string;
-    month: string;
-    day: string;
+    year: string
+    month: string
+    day: string
 }
 
 export interface AWSSecrets {

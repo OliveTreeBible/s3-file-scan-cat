@@ -1,6 +1,7 @@
-import { LFService, LoggerFactory, LoggerFactoryOptions, LogGroupRule, LogLevel } from 'typescript-logging'
+import { LFService, LoggerFactoryOptions, LogGroupRule, LogLevel } from 'typescript-logging'
 
-const options = new LoggerFactoryOptions()
-options.addLogGroupRule(new LogGroupRule(new RegExp('app.+'), LogLevel.Fatal))
-
-export const loggerFactory: LoggerFactory = LFService.createNamedLoggerFactory('S3MANAGER', options)
+export function createLogger(groupingRuleExp: RegExp, logLevel: LogLevel, loggerName: string) {
+    const options = new LoggerFactoryOptions()
+    options.addLogGroupRule(new LogGroupRule(groupingRuleExp, logLevel))
+    return LFService.createNamedLoggerFactory('s3fsc-logger-factory', options).getLogger(loggerName)
+}

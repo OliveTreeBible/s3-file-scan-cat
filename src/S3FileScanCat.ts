@@ -1,16 +1,21 @@
-import * as waitUntil from 'async-wait-until';
-import * as AWS from 'aws-sdk';
-import { ListObjectsV2Request } from 'aws-sdk/clients/s3';
-import { error } from 'console';
-import * as moment from 'moment';
-import { gzip } from 'node-gzip';
-import { mem, MemInfo } from 'node-os-utils';
-import { Logger } from 'typescript-logging';
+import * as waitUntil from 'async-wait-until'
+import * as AWS from 'aws-sdk'
+import { ListObjectsV2Request } from 'aws-sdk/clients/s3'
+import { error } from 'console'
+import * as moment from 'moment'
+import { gzip } from 'node-gzip'
+import { mem, MemInfo } from 'node-os-utils'
+import { Logger, LogLevel } from 'typescript-logging'
 
 import {
-    AWSSecrets, ConcatState, MatchedDate, PrefixEvalResult, PrefixParams, ScannerOptions
-} from './interfaces/scanner.interface';
-import { loggerFactory } from './utils/logger';
+    AWSSecrets,
+    ConcatState,
+    MatchedDate,
+    PrefixEvalResult,
+    PrefixParams,
+    ScannerOptions,
+} from './interfaces/scanner.interface'
+import { createLogger } from './utils/logger'
 
 const INFINITE_TIMEOUT = 2147483647 // This is actually 24 days but it is also the largest timeout allowed
 
@@ -22,7 +27,7 @@ type NullableString = undefined | string
 
 export class S3FileScanCat {
     private _s3: AWS.S3
-    private _log: Logger
+    private _log?: Logger
     private _delimeter: string
     private _keyParams: PrefixParams[]
     private _allPrefixes: string[]
@@ -42,11 +47,13 @@ export class S3FileScanCat {
     private _objectBodyFetchLimit: number
     private _objectBodyPutLimit: number
     private _scannerOptions: ScannerOptions
-    constructor(
-        scannerOptions: ScannerOptions,
-        awsAccess: AWSSecrets
-    ) {
-        this._log = loggerFactory.getLogger('app.partitioner')
+    constructor(scannerOptions: ScannerOptions, awsAccess: AWSSecrets) {
+        if (scannerOptions.logOptions)
+            this._log = createLogger(
+                scannerOptions.logOptions.logGroupingPattern,
+                scannerOptions.logOptions.logLevel,
+                'app.partitioner'
+            )
         this._delimeter = '/'
         this._keyParams = []
         this._allPrefixes = []
@@ -123,9 +130,10 @@ export class S3FileScanCat {
     }
 
     async scanAndProcessFiles(bucket: string, srcPrefix: string, destPrefix: string): Promise<void> {
-        this._log.trace({
-            msg: `BEGIN scanConcatenateCopy srcPrefix=${srcPrefix}:destPrefix=${destPrefix}:partitionStack=${this._scannerOptions.partitionStack}`,
-        })
+        this.log(
+            LogLevel.Trace,
+            `BEGIN scanConcatenateCopy srcPrefix=${srcPrefix}:destPrefix=${destPrefix}:partitionStack=${this._scannerOptions.partitionStack}`
+        )
         const destPath = destPrefix
 
         this._keyParams.push({
@@ -154,13 +162,13 @@ export class S3FileScanCat {
                     })
                 }
             }
-            this._log.info(`Finished concatenating and compressing JSON S3 Objects for prefix=${srcPrefix}`)
         } else {
             throw new Error('Failed to get common prefixes for directory listing in S3.')
         }
 
         //  Wait until all processes are completed.
         await waitUntil(() => this._totalPrefixesToProcess === this._prefixesProcessedTotal, INFINITE_TIMEOUT)
+        this.log(LogLevel.Info, `Finished concatenating and compressing JSON S3 Objects for prefix=${srcPrefix}`)
         this._s3 = new AWS.S3()
         this._isDone = true
     }
@@ -180,7 +188,7 @@ export class S3FileScanCat {
         destPrefix: string,
         concatState: ConcatState
     ): Promise<void> {
-        this._log.info({ msg: `BEGIN _concatFilesAtPrefix prefix=${prefix}` })
+        this.log(LogLevel.Info, `BEGIN _concatFilesAtPrefix prefix=${prefix}`)
         const listObjRequest: ListObjectsV2Request = {
             Bucket: bucket,
             Prefix: prefix.endsWith('/') ? prefix : `${prefix}/`,
@@ -217,7 +225,7 @@ export class S3FileScanCat {
                         if (s3Object.Size && s3Object.Key) {
                             objectBodyPromises.push(this._getObjectBody(bucket, s3Object.Key))
                         } else if (s3Object.Size === 0) {
-                            this._log.warn({ msg: `S3 Object had zero size ${JSON.stringify(s3Object.Key)}` })
+                            this.log(LogLevel.Warn, `S3 Object had zero size ${JSON.stringify(s3Object.Key)}`)
                         } else {
                             throw new Error('Invalid S3 Object encountered.')
                         }
@@ -234,7 +242,10 @@ export class S3FileScanCat {
                         } else {
                             objectBodyStr = objectBody
                         }
-                        if (concatState.buffer.length + objectBodyStr.length > this._scannerOptions.limits.maxFileSizeBytes) {
+                        if (
+                            concatState.buffer.length + objectBodyStr.length >
+                            this._scannerOptions.limits.maxFileSizeBytes
+                        ) {
                             this._flushBuffer(
                                 bucket,
                                 concatState.buffer,
@@ -252,7 +263,14 @@ export class S3FileScanCat {
                         }
                     })
                     if (doneFetching && concatState.buffer.length > 0) {
-                        this._flushBuffer(bucket, concatState.buffer, prefix, srcPrefix, destPrefix, concatState.fileNumber++)
+                        this._flushBuffer(
+                            bucket,
+                            concatState.buffer,
+                            prefix,
+                            srcPrefix,
+                            destPrefix,
+                            concatState.fileNumber++
+                        )
                         concatState.buffer = ''
                         concatState.continuationToken = ''
                     }
@@ -262,21 +280,19 @@ export class S3FileScanCat {
             }
             this._s3PrefixListObjectsProcessCount--
         } while (concatState.continuationToken.length > 0)
-        this._log.info({ msg: `END _concatFilesAtPrefix prefix=${prefix}` })
+        this.log(LogLevel.Info, `END _concatFilesAtPrefix prefix=${prefix}`)
         this._prefixesProcessedTotal++
     }
 
     async _getObjectBody(bucket: string, s3Key: AWS.S3.ObjectKey): Promise<AWS.S3.Body> {
-        this._log.trace({ msg: `BEGIN _getObjectBody objectKey=${s3Key}` })
+        this.log(LogLevel.Trace, `BEGIN _getObjectBody objectKey=${s3Key}`)
         let body: AWS.S3.Body
         const getObjectRequest: AWS.S3.Types.GetObjectRequest = {
             Bucket: bucket,
             Key: s3Key,
         }
         await waitUntil(
-            () =>
-                this._processAtPriorityCanProceed(0) &&
-                this._s3ObjectBodyProcessCount < this._objectBodyFetchLimit,
+            () => this._processAtPriorityCanProceed(0) && this._s3ObjectBodyProcessCount < this._objectBodyFetchLimit,
             INFINITE_TIMEOUT
         )
         this._s3ObjectBodyProcessCount++
@@ -295,14 +311,21 @@ export class S3FileScanCat {
         return body
     }
 
-    async _flushBuffer(bucket: string, buffer: string, prefix: string, srcPrefix: string, destPrefix: string, fileNumber: number) {
-        this._log.trace({ msg: `BEGIN _flushBuffer destination=${destPrefix}` })
+    async _flushBuffer(
+        bucket: string,
+        buffer: string,
+        prefix: string,
+        srcPrefix: string,
+        destPrefix: string,
+        fileNumber: number
+    ) {
+        this.log(LogLevel.Trace, `BEGIN _flushBuffer destination=${destPrefix}`)
         const fileName = `${prefix.replace(srcPrefix, destPrefix)}/${fileNumber}.json.gz`
         await this._saveToS3(bucket, buffer, fileName)
     }
 
     async _saveToS3(bucket: string, buffer: string, key: string): Promise<void> {
-        this._log.trace({ msg: `BEGIN _saveToS3 key=${key}` })
+        this.log(LogLevel.Trace, `BEGIN _saveToS3 key=${key}`)
         const body = await gzip(buffer)
         const object: AWS.S3.Types.PutObjectRequest = {
             Body: body,
@@ -310,9 +333,7 @@ export class S3FileScanCat {
             Key: key,
         }
         await waitUntil(
-            () =>
-                this._processAtPriorityCanProceed(0) &&
-                this._s3ObjectPutProcessCount < this._objectBodyPutLimit,
+            () => this._processAtPriorityCanProceed(0) && this._s3ObjectPutProcessCount < this._objectBodyPutLimit,
             INFINITE_TIMEOUT
         )
         this._s3ObjectPutProcessCount++
@@ -322,12 +343,12 @@ export class S3FileScanCat {
             throw response.error
         }
         this._s3ObjectsPutTotal++
-        this._log.trace({ msg: `END _saveToS3 key=${key}` })
+        this.log(LogLevel.Trace, `END _saveToS3 key=${key}`)
     }
 
     async _buildFullPrefixList(keyParams: PrefixParams): Promise<void> {
         this._s3BuildPrefixListObjectsProcessCount++
-        this._log.trace({ msg: `_buildFullPrefixList ${keyParams.prefix}::${keyParams.partitionStack}` })
+        this.log(LogLevel.Trace, `_buildFullPrefixList ${keyParams.prefix}::${keyParams.partitionStack}`)
         if (this._isPrefixInBounds(keyParams)) {
             const curPart = keyParams.partitionStack.shift()
             if (!curPart) {
@@ -428,8 +449,17 @@ export class S3FileScanCat {
         return inBounds
     }
 
+    log(logLevel: LogLevel, logMessage: string) {
+        if (this._log) {
+            switch (logLevel) {
+                case LogLevel.Trace:
+                    this._log.trace({ msg: logMessage })
+            }
+        }
+    }
+
     _evaluatePrefix(keyParams: PrefixParams, commonPrefix: AWS.S3.CommonPrefix, curPart: string): PrefixEvalResult {
-        this._log.trace({ msg: `_keysForPrefix ${keyParams.prefix}` })
+        this.log(LogLevel.Trace, `_keysForPrefix ${keyParams.prefix}`)
         const result: PrefixEvalResult = {}
         if (commonPrefix.Prefix) {
             const parts = commonPrefix.Prefix.split(this._delimeter)
