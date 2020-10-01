@@ -1,4 +1,4 @@
-import { LogLevel } from 'typescript-logging'
+import { LogLevel } from 'typescript-logging';
 
 export interface ScannerConfig {
     aws: AWSConfig
@@ -19,7 +19,7 @@ export interface ScannerOptions {
 
 export interface LoggerOptions {
     logLevel: LogLevel
-    logGroupingPattern: RegExp
+    logGroupingPattern: string
 }
 
 export interface ScannerLimits {

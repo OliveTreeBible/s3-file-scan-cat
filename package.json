@@ -1,6 +1,6 @@
 {
   "name": "s3-file-scan-cat",
-  "version": "0.9.2",
+  "version": "0.9.3",
   "description": "A utility to recursively scan a specified folder in S3 and concat JSON files within a single folder into a single gzip file.",
   "main": "lib/index.js",
   "types": "lib/index.d.ts",
