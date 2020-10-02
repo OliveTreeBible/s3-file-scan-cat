@@ -1,16 +1,16 @@
-import * as waitUntil from 'async-wait-until';
-import * as AWS from 'aws-sdk';
-import { ListObjectsV2Request } from 'aws-sdk/clients/s3';
-import { error } from 'console';
-import * as moment from 'moment';
-import { gzip } from 'node-gzip';
-import { mem, MemInfo } from 'node-os-utils';
-import { Logger, LogLevel } from 'typescript-logging';
+import * as waitUntil from 'async-wait-until'
+import * as AWS from 'aws-sdk'
+import { ListObjectsV2Request } from 'aws-sdk/clients/s3'
+import { error } from 'console'
+import * as moment from 'moment'
+import { gzip } from 'node-gzip'
+import { mem, MemInfo } from 'node-os-utils'
+import { Logger, LogLevel } from 'typescript-logging'
 
 import {
     AWSSecrets, ConcatState, MatchedDate, PrefixEvalResult, PrefixParams, ScannerOptions
-} from './interfaces/scanner.interface';
-import { createLogger } from './utils/logger';
+} from './interfaces/scanner.interface'
+import { createLogger } from './utils/logger'
 
 const INFINITE_TIMEOUT = 2147483647 // This is actually 24 days but it is also the largest timeout allowed
 
@@ -47,7 +47,7 @@ export class S3FileScanCat {
             this._log = createLogger(
                 scannerOptions.logOptions.logGroupingPattern,
                 scannerOptions.logOptions.logLevel,
-                'app.partitioner'
+                'app.s3-file-scan-cat'
             )
         this._delimeter = '/'
         this._keyParams = []
