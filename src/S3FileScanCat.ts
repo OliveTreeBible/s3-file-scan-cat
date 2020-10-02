@@ -1,21 +1,16 @@
-import * as waitUntil from 'async-wait-until'
-import * as AWS from 'aws-sdk'
-import { ListObjectsV2Request } from 'aws-sdk/clients/s3'
-import { error } from 'console'
-import * as moment from 'moment'
-import { gzip } from 'node-gzip'
-import { mem, MemInfo } from 'node-os-utils'
-import { Logger, LogLevel } from 'typescript-logging'
+import * as waitUntil from 'async-wait-until';
+import * as AWS from 'aws-sdk';
+import { ListObjectsV2Request } from 'aws-sdk/clients/s3';
+import { error } from 'console';
+import * as moment from 'moment';
+import { gzip } from 'node-gzip';
+import { mem, MemInfo } from 'node-os-utils';
+import { Logger, LogLevel } from 'typescript-logging';
 
 import {
-    AWSSecrets,
-    ConcatState,
-    MatchedDate,
-    PrefixEvalResult,
-    PrefixParams,
-    ScannerOptions,
-} from './interfaces/scanner.interface'
-import { createLogger } from './utils/logger'
+    AWSSecrets, ConcatState, MatchedDate, PrefixEvalResult, PrefixParams, ScannerOptions
+} from './interfaces/scanner.interface';
+import { createLogger } from './utils/logger';
 
 const INFINITE_TIMEOUT = 2147483647 // This is actually 24 days but it is also the largest timeout allowed
 
@@ -454,6 +449,22 @@ export class S3FileScanCat {
             switch (logLevel) {
                 case LogLevel.Trace:
                     this._log.trace({ msg: logMessage })
+                    break
+                case LogLevel.Debug:
+                    this._log.debug({ msg: logMessage })                    
+                    break
+                case LogLevel.Info:
+                    this._log.info({ msg: logMessage })
+                    break
+                case LogLevel.Warn:
+                    this._log.warn({ msg: logMessage })                    
+                    break
+                case LogLevel.Error:
+                    this._log.error({ msg: logMessage })
+                    break
+                case LogLevel.Fatal:
+                    this._log.fatal({ msg: logMessage })                    
+                    break
             }
         }
     }
