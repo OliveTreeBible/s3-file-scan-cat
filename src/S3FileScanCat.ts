@@ -4,11 +4,15 @@ import { ListObjectsV2Request } from 'aws-sdk/clients/s3'
 import { error } from 'console'
 import * as moment from 'moment'
 import { gzip } from 'node-gzip'
-import { mem, MemInfo } from 'node-os-utils'
 import { Logger, LogLevel } from 'typescript-logging'
 
 import {
-    AWSSecrets, ConcatState, MatchedDate, PrefixEvalResult, PrefixParams, ScannerOptions
+    AWSSecrets,
+    ConcatState,
+    MatchedDate,
+    PrefixEvalResult,
+    PrefixParams,
+    ScannerOptions,
 } from './interfaces/scanner.interface'
 import { createLogger } from './utils/logger'
 
@@ -35,8 +39,6 @@ export class S3FileScanCat {
     private _s3ObjectsFetchedTotal: number
     private _s3ObjectsPutTotal: number
     private _isDone: boolean
-    private _memInfo: undefined | MemInfo
-    private _minPercentRamFree: number
     private _objectFetchBatchSize: number
     private _prefixListObjectsLimit: number
     private _objectBodyFetchLimit: number
@@ -61,7 +63,6 @@ export class S3FileScanCat {
         this._s3ObjectsFetchedTotal = 0
         this._s3ObjectsPutTotal = 0
         this._isDone = false
-        this._minPercentRamFree = 20.0
         this._objectFetchBatchSize = 100
         this._prefixListObjectsLimit = 100
         this._objectBodyFetchLimit = 100
@@ -76,7 +77,6 @@ export class S3FileScanCat {
             s3: '2006-03-01',
         }
         this._s3 = new AWS.S3()
-        setInterval(() => this._checkUsage(), 1000)
     }
 
     get s3BuildPrefixListObjectsProcessCount(): number {
@@ -117,11 +117,6 @@ export class S3FileScanCat {
 
     get isDone(): boolean {
         return this._isDone
-    }
-
-    get percentMemoryFree(): number {
-        if (this._memInfo) return this._memInfo.freeMemPercentage
-        return 0.0
     }
 
     async scanAndProcessFiles(bucket: string, srcPrefix: string, destPrefix: string): Promise<void> {
@@ -167,14 +162,6 @@ export class S3FileScanCat {
         this._s3 = new AWS.S3()
         this._isDone = true
     }
-    _processAtPriorityCanProceed(priority: number): boolean {
-        if (this._memInfo) return this._memInfo.freeMemPercentage - priority * 5 > this._minPercentRamFree
-        return false
-    }
-
-    async _checkUsage(): Promise<void> {
-        this._memInfo = await mem.info()
-    }
 
     async _concatFilesAtPrefix(
         bucket: string,
@@ -194,9 +181,7 @@ export class S3FileScanCat {
                 listObjRequest.ContinuationToken = concatState.continuationToken
             }
             await waitUntil(
-                () =>
-                    this._processAtPriorityCanProceed(0) &&
-                    this._s3PrefixListObjectsProcessCount < this._prefixListObjectsLimit,
+                () => this._s3PrefixListObjectsProcessCount < this._prefixListObjectsLimit,
                 INFINITE_TIMEOUT
             )
             this._s3PrefixListObjectsProcessCount++
@@ -286,10 +271,7 @@ export class S3FileScanCat {
             Bucket: bucket,
             Key: s3Key,
         }
-        await waitUntil(
-            () => this._processAtPriorityCanProceed(0) && this._s3ObjectBodyProcessCount < this._objectBodyFetchLimit,
-            INFINITE_TIMEOUT
-        )
+        await waitUntil(() => this._s3ObjectBodyProcessCount < this._objectBodyFetchLimit, INFINITE_TIMEOUT)
         this._s3ObjectBodyProcessCount++
         const response = (await this._s3.getObject(getObjectRequest).promise()).$response
         this._s3ObjectBodyProcessCount--
@@ -327,10 +309,7 @@ export class S3FileScanCat {
             Bucket: bucket,
             Key: key,
         }
-        await waitUntil(
-            () => this._processAtPriorityCanProceed(0) && this._s3ObjectPutProcessCount < this._objectBodyPutLimit,
-            INFINITE_TIMEOUT
-        )
+        await waitUntil(() => this._s3ObjectPutProcessCount < this._objectBodyPutLimit, INFINITE_TIMEOUT)
         this._s3ObjectPutProcessCount++
         const response = (await this._s3.putObject(object).promise()).$response
         this._s3ObjectPutProcessCount--
@@ -451,19 +430,19 @@ export class S3FileScanCat {
                     this._log.trace({ msg: logMessage })
                     break
                 case LogLevel.Debug:
-                    this._log.debug({ msg: logMessage })                    
+                    this._log.debug({ msg: logMessage })
                     break
                 case LogLevel.Info:
                     this._log.info({ msg: logMessage })
                     break
                 case LogLevel.Warn:
-                    this._log.warn({ msg: logMessage })                    
+                    this._log.warn({ msg: logMessage })
                     break
                 case LogLevel.Error:
                     this._log.error({ msg: logMessage })
                     break
                 case LogLevel.Fatal:
-                    this._log.fatal({ msg: logMessage })                    
+                    this._log.fatal({ msg: logMessage })
                     break
             }
         }

@@ -1,4 +1,4 @@
-import { LogLevel } from 'typescript-logging';
+import { LogLevel } from 'typescript-logging'
 
 export interface ScannerConfig {
     aws: AWSConfig
@@ -28,7 +28,6 @@ export interface ScannerLimits {
     objectFetchBatchSize: number
     objectBodyFetchLimit: number
     objectBodyPutLimit: number
-    minPercentRamFree: number
     maxFileSizeBytes: number
 }
 
