@@ -6,13 +6,9 @@ import * as moment from 'moment'
 import { gzip } from 'node-gzip'
 import { Logger, LogLevel } from 'typescript-logging'
 
+import { EmptyPrefixError } from './errors/EmptyPrefixError'
 import {
-    AWSSecrets,
-    ConcatState,
-    MatchedDate,
-    PrefixEvalResult,
-    PrefixParams,
-    ScannerOptions,
+    AWSSecrets, ConcatState, MatchedDate, PrefixEvalResult, PrefixParams, ScannerOptions
 } from './interfaces/scanner.interface'
 import { createLogger } from './utils/logger'
 
@@ -153,7 +149,7 @@ export class S3FileScanCat {
                 }
             }
         } else {
-            throw new Error('Failed to get common prefixes for directory listing in S3.')
+            throw new EmptyPrefixError()
         }
 
         //  Wait until all processes are completed.
