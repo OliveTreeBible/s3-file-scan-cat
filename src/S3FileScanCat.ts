@@ -8,7 +8,12 @@ import { Logger, LogLevel } from 'typescript-logging'
 
 import { EmptyPrefixError } from './errors/EmptyPrefixError'
 import {
-    AWSSecrets, ConcatState, MatchedDate, PrefixEvalResult, PrefixParams, ScannerOptions
+    AWSSecrets,
+    ConcatState,
+    MatchedDate,
+    PrefixEvalResult,
+    PrefixParams,
+    ScannerOptions,
 } from './interfaces/scanner.interface'
 import { createLogger } from './utils/logger'
 
