@@ -335,7 +335,7 @@ export class S3FileScanCat {
                 Prefix: keyParams.prefix,
                 Delimiter: this._delimeter,
             }
-            let continuationToken: undefined | string = undefined
+            let continuationToken: undefined | string
             do {
                 listObjRequest.ContinuationToken = continuationToken
                 const response = (await this._s3.listObjectsV2(listObjRequest).promise()).$response
