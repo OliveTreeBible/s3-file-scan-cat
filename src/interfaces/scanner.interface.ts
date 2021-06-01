@@ -49,7 +49,7 @@ export interface PrefixParams {
 }
 
 export interface ConcatState {
-    continuationToken: AWS.S3.Types.Token
+    continuationToken: undefined | AWS.S3.Types.Token
     buffer: string
     fileNumber: number
 }

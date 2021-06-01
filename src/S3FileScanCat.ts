@@ -8,12 +8,7 @@ import { Logger, LogLevel } from 'typescript-logging'
 
 import { EmptyPrefixError } from './errors/EmptyPrefixError'
 import {
-    AWSSecrets,
-    ConcatState,
-    MatchedDate,
-    PrefixEvalResult,
-    PrefixParams,
-    ScannerOptions,
+    AWSSecrets, ConcatState, MatchedDate, PrefixEvalResult, PrefixParams, ScannerOptions
 } from './interfaces/scanner.interface'
 import { createLogger } from './utils/logger'
 
@@ -148,7 +143,7 @@ export class S3FileScanCat {
                 if (prefix) {
                     this._concatFilesAtPrefix(bucket, prefix, srcPrefix, destPath, {
                         buffer: '',
-                        continuationToken: '',
+                        continuationToken: undefined,
                         fileNumber: 0,
                     })
                 }
@@ -178,8 +173,10 @@ export class S3FileScanCat {
             MaxKeys: this._objectFetchBatchSize,
         }
         do {
-            if (concatState.continuationToken.length > 0) {
+            if (concatState.continuationToken) {
                 listObjRequest.ContinuationToken = concatState.continuationToken
+            } else {
+                listObjRequest.ContinuationToken = undefined
             }
             await waitUntil(
                 () => this._s3PrefixListObjectsProcessCount < this._prefixListObjectsLimit,
@@ -194,11 +191,11 @@ export class S3FileScanCat {
                 let data: NullableAWSListObjectsOutput = response.data
                 response = undefined // These build up over time, let GC get to this sooner (same with the data and contents)
                 if (data.Contents) {
-                    let doneFetching = true
                     let contents: NullableAWSObjectList = data.Contents
                     if (data.IsTruncated === true && data.NextContinuationToken !== undefined) {
                         concatState.continuationToken = data.NextContinuationToken
-                        doneFetching = false
+                    } else {
+                        concatState.continuationToken = undefined
                     }
                     data = undefined
                     let objectBodyPromises: undefined | Promise<AWS.S3.Body>[] = []
@@ -243,7 +240,7 @@ export class S3FileScanCat {
                             concatState.buffer += objectBodyStr
                         }
                     })
-                    if (doneFetching && concatState.buffer.length > 0) {
+                    if (!concatState.continuationToken && concatState.buffer.length > 0) {
                         this._flushBuffer(
                             bucket,
                             concatState.buffer,
@@ -253,14 +250,13 @@ export class S3FileScanCat {
                             concatState.fileNumber++
                         )
                         concatState.buffer = ''
-                        concatState.continuationToken = ''
                     }
                 }
             } else {
                 throw new Error(`Unexpected Error: List S3 Objects request had missing response.`)
             }
             this._s3PrefixListObjectsProcessCount--
-        } while (concatState.continuationToken.length > 0)
+        } while (concatState.continuationToken)
         this.log(LogLevel.Info, `END _concatFilesAtPrefix prefix=${prefix}`)
         this._prefixesProcessedTotal++
     }
@@ -364,7 +360,7 @@ export class S3FileScanCat {
                 } else {
                     throw new Error(`Unexpected empty response from S3. ${JSON.stringify(keyParams)}`)
                 }
-            } while(continuationToken && continuationToken.length > 0)
+            } while(continuationToken)
             
         }
         this._s3BuildPrefixListObjectsProcessCount--
