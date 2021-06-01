@@ -339,23 +339,33 @@ export class S3FileScanCat {
                 Prefix: keyParams.prefix,
                 Delimiter: this._delimeter,
             }
-            const response = (await this._s3.listObjectsV2(listObjRequest).promise()).$response
-            if (response.error) {
-                throw error
-            } else if (response.data && response.data.CommonPrefixes && response.data.CommonPrefixes.length > 0) {
-                response.data.CommonPrefixes.forEach((commonPrefix) => {
-                    const prefixEval = this._evaluatePrefix(keyParams, commonPrefix, curPart)
-                    if (prefixEval.partition) {
-                        this._allPrefixes.push(prefixEval.partition)
-                    } else if (prefixEval.keyParams) {
-                        this._keyParams.push(prefixEval.keyParams)
+            let continuationToken: undefined | string = undefined
+            do {
+                listObjRequest.ContinuationToken = continuationToken
+                const response = (await this._s3.listObjectsV2(listObjRequest).promise()).$response
+                if (response.error) {
+                    throw error
+                } else if (response.data && response.data.CommonPrefixes && response.data.CommonPrefixes.length > 0) {
+                    if(response.data.IsTruncated && response.data.NextContinuationToken) {
+                        continuationToken = response.data.NextContinuationToken
                     } else {
-                        throw new Error(`Unexpected partition info encountered. ${JSON.stringify(keyParams)}`)
+                        continuationToken = undefined
                     }
-                })
-            } else {
-                throw new Error(`Unexpected empty response from S3. ${JSON.stringify(keyParams)}`)
-            }
+                    response.data.CommonPrefixes.forEach((commonPrefix) => {
+                        const prefixEval = this._evaluatePrefix(keyParams, commonPrefix, curPart)
+                        if (prefixEval.partition) {
+                            this._allPrefixes.push(prefixEval.partition)
+                        } else if (prefixEval.keyParams) {
+                            this._keyParams.push(prefixEval.keyParams)
+                        } else {
+                            throw new Error(`Unexpected partition info encountered. ${JSON.stringify(keyParams)}`)
+                        }
+                    })
+                } else {
+                    throw new Error(`Unexpected empty response from S3. ${JSON.stringify(keyParams)}`)
+                }
+            } while(continuationToken && continuationToken.length > 0)
+            
         }
         this._s3BuildPrefixListObjectsProcessCount--
     }
