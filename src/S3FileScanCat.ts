@@ -220,24 +220,23 @@ export class S3FileScanCat {
                         } else {
                             objectBodyStr = objectBody
                         }
-                        if (
-                            concatState.buffer.length + objectBodyStr.length >
-                            this._scannerOptions.limits.maxFileSizeBytes
-                        ) {
-                            this._flushBuffer(
-                                bucket,
-                                concatState.buffer,
-                                prefix,
-                                srcPrefix,
-                                destPrefix,
-                                concatState.fileNumber++
-                            )
-                            concatState.buffer = ''
-                        }
-                        if (concatState.buffer.length > 0) {
-                            concatState.buffer += '\n' + objectBodyStr
-                        } else {
-                            concatState.buffer += objectBodyStr
+                        if(objectBodyStr.length > 0) {
+                            if (concatState.buffer.length + objectBodyStr.length > this._scannerOptions.limits.maxFileSizeBytes) {
+                                this._flushBuffer(
+                                    bucket,
+                                    concatState.buffer,
+                                    prefix,
+                                    srcPrefix,
+                                    destPrefix,
+                                    concatState.fileNumber++
+                                )
+                                concatState.buffer = ''
+                            }
+                            if (concatState.buffer.length > 0) {
+                                concatState.buffer += '\n' + objectBodyStr
+                            } else {
+                                concatState.buffer += objectBodyStr
+                            }
                         }
                     })
                     if (!concatState.continuationToken && concatState.buffer.length > 0) {
@@ -263,26 +262,61 @@ export class S3FileScanCat {
 
     async _getObjectBody(bucket: string, s3Key: AWS.S3.ObjectKey): Promise<AWS.S3.Body> {
         this.log(LogLevel.Trace, `BEGIN _getObjectBody objectKey=${s3Key}`)
-        let body: AWS.S3.Body
+        let body: AWS.S3.Body = ""
         const getObjectRequest: AWS.S3.Types.GetObjectRequest = {
             Bucket: bucket,
             Key: s3Key,
         }
         await waitUntil(() => this._s3ObjectBodyProcessCount < this._objectBodyFetchLimit, INFINITE_TIMEOUT)
         this._s3ObjectBodyProcessCount++
-        const response = (await this._s3.getObject(getObjectRequest).promise()).$response
+        let response
+        let retryCount = 0
+        // With exponential backoff the last retry waits ~13 minutes.  This gives the system a chance to recover after a failure but also allows us to move on if we can resolve this in a reasonable amount of time
+        const MAX_RETRIES = 14
+        let lastError: unknown
+        while(!response) {
+            try{
+                response = (await this._s3.getObject(getObjectRequest).promise()).$response
+                lastError = undefined
+            } catch(error) {
+                console.log(`[ERROR] S3 getObjectFailed: ${error}`)
+                lastError = error
+                if(retryCount < MAX_RETRIES) {
+                    await this._sleep(this._getWaitTimeForRetry(retryCount++))
+                } else {
+                    break
+                }
+            }
+        }
+        
+        
         this._s3ObjectBodyProcessCount--
-        if (response.error) {
-            throw response.error
+        if(response === undefined) {
+            console.log(`[ERROR]: Unexpected S3 getObject error encountered ${s3Key}:${lastError? lastError:""}`)
+        } else if (response.error) {
+            console.log(`[ERROR]: S3 getObject error encountered ${response.error}`)
         } else if (!response.data) {
-            throw new Error(`Missing response data for object ${s3Key}`)
+            console.log(`[ERROR]: Missing response data for object ${s3Key}`)
         } else if (!response.data.Body) {
-            throw new Error(`Missing response data for object ${s3Key}`)
+            console.log(`[ERROR]: Missing response data for object ${s3Key}`)
         } else {
             body = response.data.Body
         }
         this._s3ObjectsFetchedTotal++
         return body
+    }
+
+    _sleep(milliseconds: number): Promise<void> {
+        return new Promise((resolve, reject) => {
+            setTimeout(resolve, milliseconds)
+        })
+    }
+
+    // Provides an exponential backoff for wait times when s3 commands fail.
+    _getWaitTimeForRetry(retryCount: number) {
+        if(retryCount === 0)
+            return 0
+        return Math.pow(2, retryCount) * 100
     }
 
     async _flushBuffer(
