@@ -21,7 +21,6 @@ type NullableMoment = undefined | moment.Moment
 type NullableString = undefined | string
 
 export class S3FileScanCat {
-    private _s3: AWS.S3
     private _log?: Logger
     private _delimeter: string
     private _keyParams: PrefixParams[]
@@ -72,7 +71,6 @@ export class S3FileScanCat {
         AWS.config.apiVersions = {
             s3: '2006-03-01',
         }
-        this._s3 = new AWS.S3()
     }
 
     get s3BuildPrefixListObjectsProcessCount(): number {
@@ -155,7 +153,6 @@ export class S3FileScanCat {
         //  Wait until all processes are completed.
         await waitUntil(() => this._totalPrefixesToProcess === this._prefixesProcessedTotal, INFINITE_TIMEOUT)
         this.log(LogLevel.Info, `Finished concatenating and compressing JSON S3 Objects for prefix=${srcPrefix}`)
-        this._s3 = new AWS.S3()
         this._isDone = true
     }
 
@@ -183,13 +180,19 @@ export class S3FileScanCat {
                 INFINITE_TIMEOUT
             )
             this._s3PrefixListObjectsProcessCount++
-            let response: NullableAWSListObjectsResponse = (await this._s3.listObjectsV2(listObjRequest).promise())
-                .$response
+            let response: AWS.Response<AWS.S3.ListObjectsV2Output, AWS.AWSError>
+            try {
+                const s3 = new AWS.S3()
+                response = (await s3.listObjectsV2(listObjRequest).promise()).$response
+            } catch(e) {
+                this.log(LogLevel.Error, `Failed to list objects for ${listObjRequest.Prefix}, Error: ${e}`)
+                throw e
+            }
+            
             if (response.error) {
                 throw error
             } else if (response.data) {
                 let data: NullableAWSListObjectsOutput = response.data
-                response = undefined // These build up over time, let GC get to this sooner (same with the data and contents)
                 if (data.Contents) {
                     let contents: NullableAWSObjectList = data.Contents
                     if (data.IsTruncated === true && data.NextContinuationToken !== undefined) {
@@ -274,9 +277,10 @@ export class S3FileScanCat {
         // With exponential backoff the last retry waits ~13 minutes.  This gives the system a chance to recover after a failure but also allows us to move on if we can resolve this in a reasonable amount of time
         const MAX_RETRIES = 14
         let lastError: unknown
+        const s3 = new AWS.S3()
         while(!response) {
             try{
-                response = (await this._s3.getObject(getObjectRequest).promise()).$response
+                response = (await s3.getObject(getObjectRequest).promise()).$response
                 lastError = undefined
             } catch(error) {
                 console.log(`[ERROR] S3 getObjectFailed: ${error}`)
@@ -344,7 +348,14 @@ export class S3FileScanCat {
             Bucket: bucket,
             Key: key,
         }
-        const response = (await this._s3.putObject(object).promise()).$response
+        let response: AWS.Response<AWS.S3.PutObjectAclOutput, AWS.AWSError>
+        try{
+            const s3 = new AWS.S3()
+            response = (await s3.putObject(object).promise()).$response
+        } catch(e) {
+            this.log(LogLevel.Error, `Failed to save object to S3: ${key}`)
+            throw e
+        }
         this._s3ObjectPutProcessCount--
         if (response.error) {
             throw response.error
@@ -374,7 +385,14 @@ export class S3FileScanCat {
             let continuationToken: undefined | string
             do {
                 listObjRequest.ContinuationToken = continuationToken
-                const response = (await this._s3.listObjectsV2(listObjRequest).promise()).$response
+                let response: AWS.Response<AWS.S3.ListObjectsV2Output, AWS.AWSError>
+                try {
+                    const s3 = new AWS.S3()
+                    response = (await s3.listObjectsV2(listObjRequest).promise()).$response
+                } catch(e) {
+                    this.log(LogLevel.Error, `Failed to list objects at prefix ${keyParams.curPrefix}`)
+                    throw e
+                }
                 if (response.error) {
                     throw error
                 } else if (response.data && response.data.CommonPrefixes && response.data.CommonPrefixes.length > 0) {
