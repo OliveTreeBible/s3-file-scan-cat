@@ -3,8 +3,8 @@ import * as AWS from 'aws-sdk'
 import { ListObjectsV2Request } from 'aws-sdk/clients/s3'
 import { error } from 'console'
 import * as moment from 'moment'
-import { gzip } from 'node-gzip'
 import { Logger, LogLevel } from 'typescript-logging'
+import * as zlib from 'zlib'
 
 import { EmptyPrefixError } from './errors/EmptyPrefixError'
 import {
@@ -334,7 +334,7 @@ export class S3FileScanCat {
 
     async _saveToS3(bucket: string, buffer: string, key: string): Promise<void> {
         this.log(LogLevel.Trace, `BEGIN _saveToS3 key=${key}`)
-        const body = await gzip(buffer)
+        const body = zlib.gzipSync(buffer)
         const object: AWS.S3.Types.PutObjectRequest = {
             Body: body,
             Bucket: bucket,
