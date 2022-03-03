@@ -3,8 +3,8 @@ import * as AWS from 'aws-sdk'
 import { ListObjectsV2Request } from 'aws-sdk/clients/s3'
 import { error } from 'console'
 import * as moment from 'moment'
-import { gzip } from 'node-gzip'
 import { Logger, LogLevel } from 'typescript-logging'
+import * as zlib from 'zlib'
 
 import { EmptyPrefixError } from './errors/EmptyPrefixError'
 import {
@@ -21,7 +21,6 @@ type NullableMoment = undefined | moment.Moment
 type NullableString = undefined | string
 
 export class S3FileScanCat {
-    private _s3: AWS.S3
     private _log?: Logger
     private _delimeter: string
     private _keyParams: PrefixParams[]
@@ -72,7 +71,6 @@ export class S3FileScanCat {
         AWS.config.apiVersions = {
             s3: '2006-03-01',
         }
-        this._s3 = new AWS.S3()
     }
 
     get s3BuildPrefixListObjectsProcessCount(): number {
@@ -125,6 +123,7 @@ export class S3FileScanCat {
         this._keyParams.push({
             bucket,
             prefix: srcPrefix,
+            curPrefix: srcPrefix, /* This changes as we traverse down the path, srcPrefix is where we start */
             partitionStack: this._scannerOptions.partitionStack,
             bounds: this._scannerOptions.bounds,
         })
@@ -142,7 +141,7 @@ export class S3FileScanCat {
                 const prefix = this._allPrefixes.shift()
                 if (prefix) {
                     this._concatFilesAtPrefix(bucket, prefix, srcPrefix, destPath, {
-                        buffer: '',
+                        buffer: undefined,
                         continuationToken: undefined,
                         fileNumber: 0,
                     })
@@ -155,7 +154,6 @@ export class S3FileScanCat {
         //  Wait until all processes are completed.
         await waitUntil(() => this._totalPrefixesToProcess === this._prefixesProcessedTotal, INFINITE_TIMEOUT)
         this.log(LogLevel.Info, `Finished concatenating and compressing JSON S3 Objects for prefix=${srcPrefix}`)
-        this._s3 = new AWS.S3()
         this._isDone = true
     }
 
@@ -183,13 +181,19 @@ export class S3FileScanCat {
                 INFINITE_TIMEOUT
             )
             this._s3PrefixListObjectsProcessCount++
-            let response: NullableAWSListObjectsResponse = (await this._s3.listObjectsV2(listObjRequest).promise())
-                .$response
+            let response: AWS.Response<AWS.S3.ListObjectsV2Output, AWS.AWSError>
+            try {
+                const s3 = new AWS.S3()
+                response = (await s3.listObjectsV2(listObjRequest).promise()).$response
+            } catch(e) {
+                this.log(LogLevel.Error, `Failed to list objects for ${listObjRequest.Prefix}, Error: ${e}`)
+                throw e
+            }
+            
             if (response.error) {
                 throw error
             } else if (response.data) {
                 let data: NullableAWSListObjectsOutput = response.data
-                response = undefined // These build up over time, let GC get to this sooner (same with the data and contents)
                 if (data.Contents) {
                     let contents: NullableAWSObjectList = data.Contents
                     if (data.IsTruncated === true && data.NextContinuationToken !== undefined) {
@@ -221,7 +225,7 @@ export class S3FileScanCat {
                             objectBodyStr = objectBody
                         }
                         if(objectBodyStr.length > 0) {
-                            if (concatState.buffer.length + objectBodyStr.length > this._scannerOptions.limits.maxFileSizeBytes) {
+                            if (concatState.buffer && (concatState.buffer.length + objectBodyStr.length) > this._scannerOptions.limits.maxFileSizeBytes) {
                                 this._flushBuffer(
                                     bucket,
                                     concatState.buffer,
@@ -230,16 +234,16 @@ export class S3FileScanCat {
                                     destPrefix,
                                     concatState.fileNumber++
                                 )
-                                concatState.buffer = ''
+                                concatState.buffer = undefined
                             }
-                            if (concatState.buffer.length > 0) {
+                            if (concatState.buffer) {
                                 concatState.buffer += '\n' + objectBodyStr
                             } else {
-                                concatState.buffer += objectBodyStr
+                                concatState.buffer = objectBodyStr
                             }
                         }
                     })
-                    if (!concatState.continuationToken && concatState.buffer.length > 0) {
+                    if (!concatState.continuationToken && concatState.buffer && concatState.buffer.length > 0) {
                         this._flushBuffer(
                             bucket,
                             concatState.buffer,
@@ -248,7 +252,7 @@ export class S3FileScanCat {
                             destPrefix,
                             concatState.fileNumber++
                         )
-                        concatState.buffer = ''
+                        concatState.buffer = undefined
                     }
                 }
             } else {
@@ -274,9 +278,10 @@ export class S3FileScanCat {
         // With exponential backoff the last retry waits ~13 minutes.  This gives the system a chance to recover after a failure but also allows us to move on if we can resolve this in a reasonable amount of time
         const MAX_RETRIES = 14
         let lastError: unknown
+        const s3 = new AWS.S3()
         while(!response) {
             try{
-                response = (await this._s3.getObject(getObjectRequest).promise()).$response
+                response = (await s3.getObject(getObjectRequest).promise()).$response
                 lastError = undefined
             } catch(error) {
                 console.log(`[ERROR] S3 getObjectFailed: ${error}`)
@@ -334,15 +339,24 @@ export class S3FileScanCat {
 
     async _saveToS3(bucket: string, buffer: string, key: string): Promise<void> {
         this.log(LogLevel.Trace, `BEGIN _saveToS3 key=${key}`)
-        const body = await gzip(buffer)
+        await waitUntil(() => this._s3ObjectPutProcessCount < this._objectBodyPutLimit, INFINITE_TIMEOUT)
+        
+        this._s3ObjectPutProcessCount++
+
+        const body = zlib.gzipSync(buffer)
         const object: AWS.S3.Types.PutObjectRequest = {
             Body: body,
             Bucket: bucket,
             Key: key,
         }
-        await waitUntil(() => this._s3ObjectPutProcessCount < this._objectBodyPutLimit, INFINITE_TIMEOUT)
-        this._s3ObjectPutProcessCount++
-        const response = (await this._s3.putObject(object).promise()).$response
+        let response: AWS.Response<AWS.S3.PutObjectAclOutput, AWS.AWSError>
+        try{
+            const s3 = new AWS.S3()
+            response = (await s3.putObject(object).promise()).$response
+        } catch(e) {
+            this.log(LogLevel.Error, `Failed to save object to S3: ${key}`)
+            throw e
+        }
         this._s3ObjectPutProcessCount--
         if (response.error) {
             throw response.error
@@ -353,26 +367,33 @@ export class S3FileScanCat {
 
     async _buildFullPrefixList(keyParams: PrefixParams): Promise<void> {
         this._s3BuildPrefixListObjectsProcessCount++
-        this.log(LogLevel.Trace, `_buildFullPrefixList ${keyParams.prefix}::${keyParams.partitionStack}`)
+        this.log(LogLevel.Trace, `_buildFullPrefixList ${keyParams.curPrefix}::${keyParams.partitionStack}`)
         if (this._isPrefixInBounds(keyParams)) {
             const curPart = keyParams.partitionStack.shift()
             if (!curPart) {
                 throw new Error('Unexpected end of partition stack!')
             }
 
-            if (!keyParams.prefix.endsWith(this._delimeter)) {
-                keyParams.prefix += this._delimeter
+            if (!keyParams.curPrefix.endsWith(this._delimeter)) {
+                keyParams.curPrefix += this._delimeter
             }
 
             const listObjRequest: ListObjectsV2Request = {
                 Bucket: keyParams.bucket,
-                Prefix: keyParams.prefix,
+                Prefix: keyParams.curPrefix,
                 Delimiter: this._delimeter,
             }
             let continuationToken: undefined | string
             do {
                 listObjRequest.ContinuationToken = continuationToken
-                const response = (await this._s3.listObjectsV2(listObjRequest).promise()).$response
+                let response: AWS.Response<AWS.S3.ListObjectsV2Output, AWS.AWSError>
+                try {
+                    const s3 = new AWS.S3()
+                    response = (await s3.listObjectsV2(listObjRequest).promise()).$response
+                } catch(e) {
+                    this.log(LogLevel.Error, `Failed to list objects at prefix ${keyParams.curPrefix}`)
+                    throw e
+                }
                 if (response.error) {
                     throw error
                 } else if (response.data && response.data.CommonPrefixes && response.data.CommonPrefixes.length > 0) {
@@ -409,12 +430,10 @@ export class S3FileScanCat {
             let endDate: NullableMoment = moment(keyParams.bounds.endDate)
             const [endYear, endMonth, endDay] = endDate.format('YYYY-MM-DD').split('-')
             endDate = undefined
-            let basePath: NullableString = keyParams.prefix.split('/')[0]
             const dateMatcher = new RegExp(
-                `${basePath}\\/?(year=(?<year>[0-9]{4}))?(\\/month=(?<month>[0-1][0-9]))?(\\/day=(?<day>[0-3][0-9]))?`
+                `(${keyParams.prefix})(/year=(?<year>[0-9]{4}))?(/month=(?<month>[0-1][0-9]))?(/day=(?<day>[0-3][0-9]))?`
             )
-            basePath = undefined
-            const dateParts = keyParams.prefix.match(dateMatcher)?.groups as MatchedDate
+            const dateParts = keyParams.curPrefix.match(dateMatcher)?.groups as MatchedDate
             if (dateParts) {
                 if (dateParts.year && dateParts.month && dateParts.day) {
                     if (
@@ -468,41 +487,42 @@ export class S3FileScanCat {
         if (this._log) {
             switch (logLevel) {
                 case LogLevel.Trace:
-                    this._log.trace({ msg: logMessage })
+                    this._log.trace(logMessage)
                     break
                 case LogLevel.Debug:
-                    this._log.debug({ msg: logMessage })
+                    this._log.debug(logMessage)
                     break
                 case LogLevel.Info:
-                    this._log.info({ msg: logMessage })
+                    this._log.info(logMessage)
                     break
                 case LogLevel.Warn:
-                    this._log.warn({ msg: logMessage })
+                    this._log.warn(logMessage )
                     break
                 case LogLevel.Error:
-                    this._log.error({ msg: logMessage })
+                    this._log.error(logMessage)
                     break
                 case LogLevel.Fatal:
-                    this._log.fatal({ msg: logMessage })
+                    this._log.fatal(logMessage)
                     break
             }
         }
     }
 
     _evaluatePrefix(keyParams: PrefixParams, commonPrefix: AWS.S3.CommonPrefix, curPart: string): PrefixEvalResult {
-        this.log(LogLevel.Trace, `_keysForPrefix ${keyParams.prefix}`)
+        this.log(LogLevel.Trace, `_keysForPrefix ${keyParams.curPrefix}`)
         const result: PrefixEvalResult = {}
         if (commonPrefix.Prefix) {
             const parts = commonPrefix.Prefix.split(this._delimeter)
             if (parts.length > 1) {
                 const lastPart = parts[parts.length - 2]
                 if (lastPart.startsWith(curPart)) {
-                    const nextPart = `${keyParams.prefix}${lastPart}`
+                    const nextPart = `${keyParams.curPrefix}${lastPart}`
                     if (keyParams.partitionStack.length > 0) {
                         const partitionStackClone = Object.assign([], keyParams.partitionStack)
                         result.keyParams = {
                             bucket: keyParams.bucket,
-                            prefix: nextPart,
+                            prefix: keyParams.prefix,
+                            curPrefix: nextPart,
                             partitionStack: partitionStackClone,
                             bounds: keyParams.bounds,
                         }
