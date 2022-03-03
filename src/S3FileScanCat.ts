@@ -334,14 +334,16 @@ export class S3FileScanCat {
 
     async _saveToS3(bucket: string, buffer: string, key: string): Promise<void> {
         this.log(LogLevel.Trace, `BEGIN _saveToS3 key=${key}`)
+        await waitUntil(() => this._s3ObjectPutProcessCount < this._objectBodyPutLimit, INFINITE_TIMEOUT)
+        
+        this._s3ObjectPutProcessCount++
+
         const body = zlib.gzipSync(buffer)
         const object: AWS.S3.Types.PutObjectRequest = {
             Body: body,
             Bucket: bucket,
             Key: key,
         }
-        await waitUntil(() => this._s3ObjectPutProcessCount < this._objectBodyPutLimit, INFINITE_TIMEOUT)
-        this._s3ObjectPutProcessCount++
         const response = (await this._s3.putObject(object).promise()).$response
         this._s3ObjectPutProcessCount--
         if (response.error) {
