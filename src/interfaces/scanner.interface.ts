@@ -44,13 +44,14 @@ export interface AWSS3Config {
 export interface PrefixParams {
     bucket: string
     prefix: string
+    curPrefix: string
     partitionStack: string[]
     bounds: ScannerBounds | undefined
 }
 
 export interface ConcatState {
     continuationToken: undefined | AWS.S3.Types.Token
-    buffer: string
+    buffer: undefined | string
     fileNumber: number
 }
 

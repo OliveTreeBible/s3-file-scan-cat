@@ -123,6 +123,7 @@ export class S3FileScanCat {
         this._keyParams.push({
             bucket,
             prefix: srcPrefix,
+            curPrefix: srcPrefix, /* This changes as we traverse down the path, srcPrefix is where we start */
             partitionStack: this._scannerOptions.partitionStack,
             bounds: this._scannerOptions.bounds,
         })
@@ -140,7 +141,7 @@ export class S3FileScanCat {
                 const prefix = this._allPrefixes.shift()
                 if (prefix) {
                     this._concatFilesAtPrefix(bucket, prefix, srcPrefix, destPath, {
-                        buffer: '',
+                        buffer: undefined,
                         continuationToken: undefined,
                         fileNumber: 0,
                     })
@@ -224,7 +225,7 @@ export class S3FileScanCat {
                             objectBodyStr = objectBody
                         }
                         if(objectBodyStr.length > 0) {
-                            if (concatState.buffer.length + objectBodyStr.length > this._scannerOptions.limits.maxFileSizeBytes) {
+                            if (concatState.buffer && (concatState.buffer.length + objectBodyStr.length) > this._scannerOptions.limits.maxFileSizeBytes) {
                                 this._flushBuffer(
                                     bucket,
                                     concatState.buffer,
@@ -233,16 +234,16 @@ export class S3FileScanCat {
                                     destPrefix,
                                     concatState.fileNumber++
                                 )
-                                concatState.buffer = ''
+                                concatState.buffer = undefined
                             }
-                            if (concatState.buffer.length > 0) {
+                            if (concatState.buffer) {
                                 concatState.buffer += '\n' + objectBodyStr
                             } else {
-                                concatState.buffer += objectBodyStr
+                                concatState.buffer = objectBodyStr
                             }
                         }
                     })
-                    if (!concatState.continuationToken && concatState.buffer.length > 0) {
+                    if (!concatState.continuationToken && concatState.buffer && concatState.buffer.length > 0) {
                         this._flushBuffer(
                             bucket,
                             concatState.buffer,
@@ -251,7 +252,7 @@ export class S3FileScanCat {
                             destPrefix,
                             concatState.fileNumber++
                         )
-                        concatState.buffer = ''
+                        concatState.buffer = undefined
                     }
                 }
             } else {
@@ -366,20 +367,20 @@ export class S3FileScanCat {
 
     async _buildFullPrefixList(keyParams: PrefixParams): Promise<void> {
         this._s3BuildPrefixListObjectsProcessCount++
-        this.log(LogLevel.Trace, `_buildFullPrefixList ${keyParams.prefix}::${keyParams.partitionStack}`)
+        this.log(LogLevel.Trace, `_buildFullPrefixList ${keyParams.curPrefix}::${keyParams.partitionStack}`)
         if (this._isPrefixInBounds(keyParams)) {
             const curPart = keyParams.partitionStack.shift()
             if (!curPart) {
                 throw new Error('Unexpected end of partition stack!')
             }
 
-            if (!keyParams.prefix.endsWith(this._delimeter)) {
-                keyParams.prefix += this._delimeter
+            if (!keyParams.curPrefix.endsWith(this._delimeter)) {
+                keyParams.curPrefix += this._delimeter
             }
 
             const listObjRequest: ListObjectsV2Request = {
                 Bucket: keyParams.bucket,
-                Prefix: keyParams.prefix,
+                Prefix: keyParams.curPrefix,
                 Delimiter: this._delimeter,
             }
             let continuationToken: undefined | string
@@ -429,12 +430,10 @@ export class S3FileScanCat {
             let endDate: NullableMoment = moment(keyParams.bounds.endDate)
             const [endYear, endMonth, endDay] = endDate.format('YYYY-MM-DD').split('-')
             endDate = undefined
-            let basePath: NullableString = keyParams.prefix.split('/')[0]
             const dateMatcher = new RegExp(
-                `${basePath}\\/?(year=(?<year>[0-9]{4}))?(\\/month=(?<month>[0-1][0-9]))?(\\/day=(?<day>[0-3][0-9]))?`
+                `(${keyParams.prefix})(/year=(?<year>[0-9]{4}))?(/month=(?<month>[0-1][0-9]))?(/day=(?<day>[0-3][0-9]))?`
             )
-            basePath = undefined
-            const dateParts = keyParams.prefix.match(dateMatcher)?.groups as MatchedDate
+            const dateParts = keyParams.curPrefix.match(dateMatcher)?.groups as MatchedDate
             if (dateParts) {
                 if (dateParts.year && dateParts.month && dateParts.day) {
                     if (
@@ -488,41 +487,42 @@ export class S3FileScanCat {
         if (this._log) {
             switch (logLevel) {
                 case LogLevel.Trace:
-                    this._log.trace({ msg: logMessage })
+                    this._log.trace(logMessage)
                     break
                 case LogLevel.Debug:
-                    this._log.debug({ msg: logMessage })
+                    this._log.debug(logMessage)
                     break
                 case LogLevel.Info:
-                    this._log.info({ msg: logMessage })
+                    this._log.info(logMessage)
                     break
                 case LogLevel.Warn:
-                    this._log.warn({ msg: logMessage })
+                    this._log.warn(logMessage )
                     break
                 case LogLevel.Error:
-                    this._log.error({ msg: logMessage })
+                    this._log.error(logMessage)
                     break
                 case LogLevel.Fatal:
-                    this._log.fatal({ msg: logMessage })
+                    this._log.fatal(logMessage)
                     break
             }
         }
     }
 
     _evaluatePrefix(keyParams: PrefixParams, commonPrefix: AWS.S3.CommonPrefix, curPart: string): PrefixEvalResult {
-        this.log(LogLevel.Trace, `_keysForPrefix ${keyParams.prefix}`)
+        this.log(LogLevel.Trace, `_keysForPrefix ${keyParams.curPrefix}`)
         const result: PrefixEvalResult = {}
         if (commonPrefix.Prefix) {
             const parts = commonPrefix.Prefix.split(this._delimeter)
             if (parts.length > 1) {
                 const lastPart = parts[parts.length - 2]
                 if (lastPart.startsWith(curPart)) {
-                    const nextPart = `${keyParams.prefix}${lastPart}`
+                    const nextPart = `${keyParams.curPrefix}${lastPart}`
                     if (keyParams.partitionStack.length > 0) {
                         const partitionStackClone = Object.assign([], keyParams.partitionStack)
                         result.keyParams = {
                             bucket: keyParams.bucket,
-                            prefix: nextPart,
+                            prefix: keyParams.prefix,
+                            curPrefix: nextPart,
                             partitionStack: partitionStackClone,
                             bounds: keyParams.bounds,
                         }
