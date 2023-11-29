@@ -217,11 +217,12 @@ export class S3FileScanCat {
         const body = await this._getObjectBody(bucket, s3Key)
         const fileName = s3Key.split('/').pop()
         if(fileName === undefined) {
-            console.error(`Object ${s3Key} missing fileName??`)
+            this.log(LogLevel.Error, `Object ${s3Key} missing fileName??`)
             return false
         }
         const newKey = `content/managed_annotations/annotations/content_style/${fileName}`
         await this._putObject(bucket, newKey, body)
+        this.log(LogLevel.Info, `Copied ${s3Key}`)
         return true
     }
 
