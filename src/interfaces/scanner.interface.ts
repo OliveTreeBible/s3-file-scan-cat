@@ -1,7 +1,6 @@
 import { LogLevel } from 'typescript-logging'
 
 export interface ScannerConfig {
-    aws: AWSConfig
     scanner: ScannerOptions
 }
 
@@ -28,17 +27,6 @@ export interface ScannerLimits {
     objectFetchBatchSize: number
     objectBodyFetchLimit: number
     objectBodyPutLimit: number
-    maxFileSizeBytes: number
-}
-
-export interface AWSConfig {
-    s3: AWSS3Config
-}
-
-export interface AWSS3Config {
-    bucket: string
-    scannerPrefix: string
-    destinationPrefix: string
 }
 
 export interface PrefixParams {
@@ -51,7 +39,6 @@ export interface PrefixParams {
 
 export interface ConcatState {
     continuationToken: undefined | AWS.S3.Types.Token
-    buffer: undefined | string
     fileNumber: number
 }
 

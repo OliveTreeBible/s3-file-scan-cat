@@ -4,11 +4,10 @@ import { ListObjectsV2Request } from 'aws-sdk/clients/s3'
 import { error } from 'console'
 import * as moment from 'moment'
 import { Logger, LogLevel } from 'typescript-logging'
-import * as zlib from 'zlib'
 
 import { EmptyPrefixError } from './errors/EmptyPrefixError'
 import {
-    AWSSecrets, ConcatState, MatchedDate, PrefixEvalResult, PrefixParams, ScannerOptions
+    AWSSecrets, ConcatState, PrefixEvalResult, PrefixParams, ScannerOptions
 } from './interfaces/scanner.interface'
 import { createLogger } from './utils/logger'
 
@@ -113,12 +112,11 @@ export class S3FileScanCat {
         return this._isDone
     }
 
-    async scanAndProcessFiles(bucket: string, srcPrefix: string, destPrefix: string): Promise<void> {
+    async scanAndProcessFiles(bucket: string, srcPrefix: string): Promise<void> {
         this.log(
             LogLevel.Trace,
-            `BEGIN scanConcatenateCopy srcPrefix=${srcPrefix}:destPrefix=${destPrefix}:partitionStack=${this._scannerOptions.partitionStack}`
+            `BEGIN scanConcatenateCopy srcPrefix=${srcPrefix}:partitionStack=${this._scannerOptions.partitionStack}`
         )
-        const destPath = destPrefix
 
         this._keyParams.push({
             bucket,
@@ -127,21 +125,13 @@ export class S3FileScanCat {
             partitionStack: this._scannerOptions.partitionStack,
             bounds: this._scannerOptions.bounds,
         })
-        while (this._keyParams.length > 0 || this._s3BuildPrefixListObjectsProcessCount > 0) {
-            await waitUntil(
-                () => this._s3BuildPrefixListObjectsProcessCount < this._scannerOptions.limits.maxBuildPrefixList,
-                INFINITE_TIMEOUT
-            )
-            const keyParam = this._keyParams.shift()
-            if (keyParam) this._buildFullPrefixList(keyParam)
-        }
+        this._allPrefixes = ['/content_style']
         this._totalPrefixesToProcess = this._allPrefixes.length
         if (this._allPrefixes.length > 0) {
             while (this._allPrefixes.length > 0) {
                 const prefix = this._allPrefixes.shift()
                 if (prefix) {
-                    this._concatFilesAtPrefix(bucket, prefix, srcPrefix, destPath, {
-                        buffer: undefined,
+                    this._copyFilesAtPrefix(bucket, prefix, {
                         continuationToken: undefined,
                         fileNumber: 0,
                     })
@@ -157,11 +147,9 @@ export class S3FileScanCat {
         this._isDone = true
     }
 
-    async _concatFilesAtPrefix(
+    async _copyFilesAtPrefix(
         bucket: string,
         prefix: string,
-        srcPrefix: string,
-        destPrefix: string,
         concatState: ConcatState
     ): Promise<void> {
         this.log(LogLevel.Info, `BEGIN _concatFilesAtPrefix prefix=${prefix}`)
@@ -202,10 +190,10 @@ export class S3FileScanCat {
                         concatState.continuationToken = undefined
                     }
                     data = undefined
-                    let objectBodyPromises: undefined | Promise<AWS.S3.Body>[] = []
+                    let objectCopyPromises: undefined | Promise<boolean>[] = []
                     for (const s3Object of contents) {
                         if (s3Object.Size && s3Object.Key) {
-                            objectBodyPromises.push(this._getObjectBody(bucket, s3Object.Key))
+                            objectCopyPromises.push(this._copyObject(bucket, s3Object.Key))
                         } else if (s3Object.Size === 0) {
                             this.log(LogLevel.Warn, `S3 Object had zero size ${JSON.stringify(s3Object.Key)}`)
                         } else {
@@ -214,46 +202,7 @@ export class S3FileScanCat {
                     }
                     contents = undefined
 
-                    const objectBodies = await Promise.all(objectBodyPromises)
-                    objectBodyPromises = undefined
-
-                    objectBodies.forEach((objectBody) => {
-                        let objectBodyStr: string
-                        if (typeof objectBody !== 'string') {
-                            objectBodyStr = objectBody.toString()
-                        } else {
-                            objectBodyStr = objectBody
-                        }
-                        if(objectBodyStr.length > 0) {
-                            if (concatState.buffer && (concatState.buffer.length + objectBodyStr.length) > this._scannerOptions.limits.maxFileSizeBytes) {
-                                this._flushBuffer(
-                                    bucket,
-                                    concatState.buffer,
-                                    prefix,
-                                    srcPrefix,
-                                    destPrefix,
-                                    concatState.fileNumber++
-                                )
-                                concatState.buffer = undefined
-                            }
-                            if (concatState.buffer) {
-                                concatState.buffer += '\n' + objectBodyStr
-                            } else {
-                                concatState.buffer = objectBodyStr
-                            }
-                        }
-                    })
-                    if (!concatState.continuationToken && concatState.buffer && concatState.buffer.length > 0) {
-                        this._flushBuffer(
-                            bucket,
-                            concatState.buffer,
-                            prefix,
-                            srcPrefix,
-                            destPrefix,
-                            concatState.fileNumber++
-                        )
-                        concatState.buffer = undefined
-                    }
+                    await Promise.all(objectCopyPromises)
                 }
             } else {
                 throw new Error(`Unexpected Error: List S3 Objects request had missing response.`)
@@ -262,6 +211,18 @@ export class S3FileScanCat {
         } while (concatState.continuationToken)
         this.log(LogLevel.Info, `END _concatFilesAtPrefix prefix=${prefix}`)
         this._prefixesProcessedTotal++
+    }
+
+    async _copyObject(bucket: string, s3Key: AWS.S3.ObjectKey): Promise<boolean> {
+        const body = await this._getObjectBody(bucket, s3Key)
+        const fileName = s3Key.split('/').pop()
+        if(fileName === undefined) {
+            console.error(`Object ${s3Key} missing fileName??`)
+            return false
+        }
+        const newKey = `content/managed_annotations/annotations/content_style/${fileName}`
+        await this._putObject(bucket, newKey, body)
+        return true
     }
 
     async _getObjectBody(bucket: string, s3Key: AWS.S3.ObjectKey): Promise<AWS.S3.Body> {
@@ -311,6 +272,33 @@ export class S3FileScanCat {
         return body
     }
 
+    async _putObject(bucket: string, s3Key: AWS.S3.ObjectKey, content:AWS.S3.Body): Promise<void> {
+        this.log(LogLevel.Trace, `BEGIN _putObject key=${s3Key}`)
+        await waitUntil(() => this._s3ObjectPutProcessCount < this._objectBodyPutLimit, INFINITE_TIMEOUT)
+        
+        this._s3ObjectPutProcessCount++
+
+        const object: AWS.S3.Types.PutObjectRequest = {
+            Body: content,
+            Bucket: bucket,
+            Key: s3Key,
+        }
+        let response: AWS.Response<AWS.S3.PutObjectAclOutput, AWS.AWSError>
+        try{
+            const s3 = new AWS.S3()
+            response = (await s3.putObject(object).promise()).$response
+        } catch(e) {
+            this.log(LogLevel.Error, `Failed to save object to S3: ${s3Key}`)
+            throw e
+        }
+        this._s3ObjectPutProcessCount--
+        if (response.error) {
+            throw response.error
+        }
+        this._s3ObjectsPutTotal++
+        this.log(LogLevel.Trace, `END _putObject key=${s3Key}`)
+    }
+
     _sleep(milliseconds: number): Promise<void> {
         return new Promise((resolve, reject) => {
             setTimeout(resolve, milliseconds)
@@ -322,166 +310,7 @@ export class S3FileScanCat {
         if(retryCount === 0)
             return 0
         return Math.pow(2, retryCount) * 100
-    }
-
-    async _flushBuffer(
-        bucket: string,
-        buffer: string,
-        prefix: string,
-        srcPrefix: string,
-        destPrefix: string,
-        fileNumber: number
-    ) {
-        this.log(LogLevel.Trace, `BEGIN _flushBuffer destination=${destPrefix}`)
-        const fileName = `${prefix.replace(srcPrefix, destPrefix)}/${fileNumber}.json.gz`
-        await this._saveToS3(bucket, buffer, fileName)
-    }
-
-    async _saveToS3(bucket: string, buffer: string, key: string): Promise<void> {
-        this.log(LogLevel.Trace, `BEGIN _saveToS3 key=${key}`)
-        await waitUntil(() => this._s3ObjectPutProcessCount < this._objectBodyPutLimit, INFINITE_TIMEOUT)
-        
-        this._s3ObjectPutProcessCount++
-
-        const body = zlib.gzipSync(buffer)
-        const object: AWS.S3.Types.PutObjectRequest = {
-            Body: body,
-            Bucket: bucket,
-            Key: key,
-        }
-        let response: AWS.Response<AWS.S3.PutObjectAclOutput, AWS.AWSError>
-        try{
-            const s3 = new AWS.S3()
-            response = (await s3.putObject(object).promise()).$response
-        } catch(e) {
-            this.log(LogLevel.Error, `Failed to save object to S3: ${key}`)
-            throw e
-        }
-        this._s3ObjectPutProcessCount--
-        if (response.error) {
-            throw response.error
-        }
-        this._s3ObjectsPutTotal++
-        this.log(LogLevel.Trace, `END _saveToS3 key=${key}`)
-    }
-
-    async _buildFullPrefixList(keyParams: PrefixParams): Promise<void> {
-        this._s3BuildPrefixListObjectsProcessCount++
-        this.log(LogLevel.Trace, `_buildFullPrefixList ${keyParams.curPrefix}::${keyParams.partitionStack}`)
-        if (this._isPrefixInBounds(keyParams)) {
-            const curPart = keyParams.partitionStack.shift()
-            if (!curPart) {
-                throw new Error('Unexpected end of partition stack!')
-            }
-
-            if (!keyParams.curPrefix.endsWith(this._delimeter)) {
-                keyParams.curPrefix += this._delimeter
-            }
-
-            const listObjRequest: ListObjectsV2Request = {
-                Bucket: keyParams.bucket,
-                Prefix: keyParams.curPrefix,
-                Delimiter: this._delimeter,
-            }
-            let continuationToken: undefined | string
-            do {
-                listObjRequest.ContinuationToken = continuationToken
-                let response: AWS.Response<AWS.S3.ListObjectsV2Output, AWS.AWSError>
-                try {
-                    const s3 = new AWS.S3()
-                    response = (await s3.listObjectsV2(listObjRequest).promise()).$response
-                } catch(e) {
-                    this.log(LogLevel.Error, `Failed to list objects at prefix ${keyParams.curPrefix}`)
-                    throw e
-                }
-                if (response.error) {
-                    throw error
-                } else if (response.data && response.data.CommonPrefixes && response.data.CommonPrefixes.length > 0) {
-                    if(response.data.IsTruncated && response.data.NextContinuationToken) {
-                        continuationToken = response.data.NextContinuationToken
-                    } else {
-                        continuationToken = undefined
-                    }
-                    response.data.CommonPrefixes.forEach((commonPrefix) => {
-                        const prefixEval = this._evaluatePrefix(keyParams, commonPrefix, curPart)
-                        if (prefixEval.partition) {
-                            this._allPrefixes.push(prefixEval.partition)
-                        } else if (prefixEval.keyParams) {
-                            this._keyParams.push(prefixEval.keyParams)
-                        } else {
-                            throw new Error(`Unexpected partition info encountered. ${JSON.stringify(keyParams)}`)
-                        }
-                    })
-                } else {
-                    throw new Error(`Unexpected empty response from S3. ${JSON.stringify(keyParams)}`)
-                }
-            } while(continuationToken)
-            
-        }
-        this._s3BuildPrefixListObjectsProcessCount--
-    }
-
-    _isPrefixInBounds(keyParams: PrefixParams) {
-        let inBounds
-        if (keyParams.bounds) {
-            let startDate: NullableMoment = moment(keyParams.bounds.startDate)
-            const [startYear, startMonth, startDay] = startDate.format('YYYY-MM-DD').split('-')
-            startDate = undefined
-            let endDate: NullableMoment = moment(keyParams.bounds.endDate)
-            const [endYear, endMonth, endDay] = endDate.format('YYYY-MM-DD').split('-')
-            endDate = undefined
-            const dateMatcher = new RegExp(
-                `(${keyParams.prefix})(/year=(?<year>[0-9]{4}))?(/month=(?<month>[0-1][0-9]))?(/day=(?<day>[0-3][0-9]))?`
-            )
-            const dateParts = keyParams.curPrefix.match(dateMatcher)?.groups as MatchedDate
-            if (dateParts) {
-                if (dateParts.year && dateParts.month && dateParts.day) {
-                    if (
-                        (dateParts.year > startYear ||
-                            (dateParts.year === startYear && dateParts.month > startMonth) ||
-                            (dateParts.year === startYear &&
-                                dateParts.month === startMonth &&
-                                dateParts.day >= startDay)) &&
-                        (dateParts.year < endYear ||
-                            (dateParts.year === endYear && dateParts.month < endMonth) ||
-                            (dateParts.year === endYear && dateParts.month === endMonth && dateParts.day <= endDay))
-                    ) {
-                        inBounds = true
-                    } else {
-                        inBounds = false
-                    }
-                } else if (dateParts.year && dateParts.month) {
-                    if (
-                        (dateParts.year > startYear ||
-                            (dateParts.year === startYear && dateParts.month >= startMonth)) &&
-                        (dateParts.year < endYear || (dateParts.year === endYear && dateParts.month <= endMonth))
-                    ) {
-                        inBounds = true
-                    } else {
-                        inBounds = false
-                    }
-                } else if (dateParts.year) {
-                    if (dateParts.year >= startYear && dateParts.year <= endYear) {
-                        inBounds = true
-                    } else {
-                        inBounds = false
-                    }
-                } else {
-                    // Having none of the date parts implies the prefix is
-                    // currently date agnositc and thus, it is in bounds.
-                    // Similar arguments can be made for the previous
-                    // else if statements - dctrotz 07/23/2020
-                    inBounds = true
-                }
-            } else {
-                throw new Error('Invalid prefix provided.')
-            }
-        } else {
-            // No bounds provided means all prefxes are within the bounds
-            inBounds = true
-        }
-        return inBounds
-    }
+    }    
 
     log(logLevel: LogLevel, logMessage: string) {
         if (this._log) {
