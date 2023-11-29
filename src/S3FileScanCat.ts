@@ -39,12 +39,45 @@ export class S3FileScanCat {
     private _objectBodyPutLimit: number
     private _scannerOptions: ScannerOptions
     constructor(scannerOptions: ScannerOptions, awsAccess: AWSSecrets) {
-        if (scannerOptions.logOptions)
+        if (scannerOptions.logOptions) {
+            const logOptions = scannerOptions.logOptions
+            let logLevel = logOptions.logLevel
+            if(typeof logLevel === 'string' && !Number.isInteger(logLevel)) {
+                switch((logLevel as string).toLowerCase()) {
+                    case 'trace': {
+                        logLevel = 0
+                        break
+                    }
+                    case 'debug': {
+                        logLevel = 1
+                        break
+                    }
+                    case 'info': {
+                        logLevel = 2
+                        break
+                    }
+                    case 'warn': {
+                        logLevel = 3
+                        break
+                    }
+                    case 'error': {
+                        logLevel = 4
+                        break
+                    }
+                    case 'fatal': {
+                        logLevel = 5
+                        break
+                    }
+                    default: 
+                        logLevel = 0
+                }
+            }
             this._log = createLogger(
-                scannerOptions.logOptions.logGroupingPattern,
-                scannerOptions.logOptions.logLevel,
+                logOptions.logGroupingPattern,
+                logLevel,
                 'app.s3-file-scan-cat'
             )
+        }
         this._delimeter = '/'
         this._keyParams = []
         this._allPrefixes = []
