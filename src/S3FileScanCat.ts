@@ -135,16 +135,13 @@ export class S3FileScanCat {
             const keyParam = this._keyParams.shift()
             if (keyParam) this._buildFullPrefixList(keyParam)
         }
+        this._prefixesProcessedTotal = 0
         this._totalPrefixesToProcess = this._allPrefixes.length
         if (this._allPrefixes.length > 0) {
             while (this._allPrefixes.length > 0) {
                 const prefix = this._allPrefixes.shift()
                 if (prefix) {
-                    this._concatFilesAtPrefix(bucket, prefix, srcPrefix, destPath, {
-                        buffer: undefined,
-                        continuationToken: undefined,
-                        fileNumber: 0,
-                    })
+                    this.concatFilesAtPrefix(bucket, prefix, srcPrefix, destPath)
                 }
             }
         } else {
@@ -157,14 +154,18 @@ export class S3FileScanCat {
         this._isDone = true
     }
 
-    async _concatFilesAtPrefix(
+    async concatFilesAtPrefix(
         bucket: string,
         prefix: string,
         srcPrefix: string,
-        destPrefix: string,
-        concatState: ConcatState
+        destPrefix: string
     ): Promise<void> {
         this.log(LogLevel.Info, `BEGIN _concatFilesAtPrefix prefix=${prefix}`)
+        const concatState: ConcatState = {
+            buffer: undefined,
+            continuationToken: undefined,
+            fileNumber: 0,
+        }
         const listObjRequest: ListObjectsV2Request = {
             Bucket: bucket,
             Prefix: prefix.endsWith('/') ? prefix : `${prefix}/`,
