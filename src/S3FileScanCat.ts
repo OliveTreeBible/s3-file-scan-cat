@@ -38,6 +38,7 @@ export class S3FileScanCat {
     private _prefixListObjectsLimit: number
     private _objectBodyFetchLimit: number
     private _objectBodyPutLimit: number
+    private _maxFileSizeBytes: number
     private _scannerOptions: ScannerOptions
     constructor(scannerOptions: ScannerOptions, awsAccess: AWSSecrets) {
         if (scannerOptions.logOptions)
@@ -58,10 +59,11 @@ export class S3FileScanCat {
         this._s3ObjectsFetchedTotal = 0
         this._s3ObjectsPutTotal = 0
         this._isDone = false
-        this._objectFetchBatchSize = 100
-        this._prefixListObjectsLimit = 100
-        this._objectBodyFetchLimit = 100
-        this._objectBodyPutLimit = 100
+        this._objectFetchBatchSize = scannerOptions.limits?.objectFetchBatchSize !== undefined ? scannerOptions.limits?.objectFetchBatchSize :  100
+        this._prefixListObjectsLimit = scannerOptions.limits?.prefixListObjectsLimit !== undefined ? scannerOptions.limits?.prefixListObjectsLimit : 100
+        this._objectBodyFetchLimit = scannerOptions.limits?.objectBodyFetchLimit !== undefined ? scannerOptions.limits?.objectBodyFetchLimit : 100
+        this._objectBodyPutLimit = scannerOptions.limits?.objectBodyPutLimit !== undefined ? scannerOptions.limits?.objectBodyPutLimit : 100
+        this._maxFileSizeBytes = scannerOptions.limits?.maxFileSizeBytes !== undefined ? scannerOptions.limits?.maxFileSizeBytes : 128 * 1024 * 1024
         this._scannerOptions = scannerOptions
         AWS.config.update({
             region: 'us-east-1',
@@ -225,8 +227,12 @@ export class S3FileScanCat {
                         } else {
                             objectBodyStr = objectBody
                         }
-                        if(objectBodyStr.length > 0) {
-                            if (concatState.buffer && (concatState.buffer.length + objectBodyStr.length) > this._scannerOptions.limits.maxFileSizeBytes) {
+                        if (objectBodyStr.length > 0) {
+                            if (
+                                concatState.buffer &&
+                                concatState.buffer.length + objectBodyStr.length >
+                                    this._maxFileSizeBytes
+                            ) {
                                 this._flushBuffer(
                                     bucket,
                                     concatState.buffer,
