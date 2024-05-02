@@ -125,7 +125,7 @@ export class S3FileScanCat {
         this._keyParams.push({
             bucket,
             prefix: srcPrefix,
-            curPrefix: srcPrefix, /* This changes as we traverse down the path, srcPrefix is where we start */
+            curPrefix: srcPrefix /* This changes as we traverse down the path, srcPrefix is where we start */,
             partitionStack: this._scannerOptions.partitionStack,
             bounds: this._scannerOptions.bounds,
         })
@@ -156,12 +156,7 @@ export class S3FileScanCat {
         this._isDone = true
     }
 
-    async concatFilesAtPrefix(
-        bucket: string,
-        prefix: string,
-        srcPrefix: string,
-        destPrefix: string
-    ): Promise<void> {
+    async concatFilesAtPrefix(bucket: string, prefix: string, srcPrefix: string, destPrefix: string): Promise<void> {
         this.log(LogLevel.Info, `BEGIN _concatFilesAtPrefix prefix=${prefix}`)
         const concatState: ConcatState = {
             buffer: undefined,
@@ -188,11 +183,11 @@ export class S3FileScanCat {
             try {
                 const s3 = new AWS.S3()
                 response = (await s3.listObjectsV2(listObjRequest).promise()).$response
-            } catch(e) {
+            } catch (e) {
                 this.log(LogLevel.Error, `Failed to list objects for ${listObjRequest.Prefix}, Error: ${e}`)
                 throw e
             }
-            
+
             if (response.error) {
                 throw error
             } else if (response.data) {
@@ -273,7 +268,7 @@ export class S3FileScanCat {
 
     async _getObjectBody(bucket: string, s3Key: AWS.S3.ObjectKey): Promise<AWS.S3.Body> {
         this.log(LogLevel.Trace, `BEGIN _getObjectBody objectKey=${s3Key}`)
-        let body: AWS.S3.Body = ""
+        let body: AWS.S3.Body = ''
         const getObjectRequest: AWS.S3.Types.GetObjectRequest = {
             Bucket: bucket,
             Key: s3Key,
@@ -286,25 +281,24 @@ export class S3FileScanCat {
         const MAX_RETRIES = 14
         let lastError: unknown
         const s3 = new AWS.S3()
-        while(!response) {
-            try{
+        while (!response) {
+            try {
                 response = (await s3.getObject(getObjectRequest).promise()).$response
                 lastError = undefined
-            } catch(error) {
+            } catch (error) {
                 console.log(`[ERROR] S3 getObjectFailed: ${error}`)
                 lastError = error
-                if(retryCount < MAX_RETRIES) {
+                if (retryCount < MAX_RETRIES) {
                     await this._sleep(this._getWaitTimeForRetry(retryCount++))
                 } else {
                     break
                 }
             }
         }
-        
-        
+
         this._s3ObjectBodyProcessCount--
-        if(response === undefined) {
-            console.log(`[ERROR]: Unexpected S3 getObject error encountered ${s3Key}:${lastError? lastError:""}`)
+        if (response === undefined) {
+            console.log(`[ERROR]: Unexpected S3 getObject error encountered ${s3Key}:${lastError ? lastError : ''}`)
         } else if (response.error) {
             console.log(`[ERROR]: S3 getObject error encountered ${response.error}`)
         } else if (!response.data) {
@@ -326,8 +320,7 @@ export class S3FileScanCat {
 
     // Provides an exponential backoff for wait times when s3 commands fail.
     _getWaitTimeForRetry(retryCount: number) {
-        if(retryCount === 0)
-            return 0
+        if (retryCount === 0) return 0
         return Math.pow(2, retryCount) * 100
     }
 
@@ -347,7 +340,7 @@ export class S3FileScanCat {
     async _saveToS3(bucket: string, buffer: string, key: string): Promise<void> {
         this.log(LogLevel.Trace, `BEGIN _saveToS3 key=${key}`)
         await waitUntil(() => this._s3ObjectPutProcessCount < this._objectBodyPutLimit, INFINITE_TIMEOUT)
-        
+
         this._s3ObjectPutProcessCount++
 
         const body = zlib.gzipSync(buffer)
@@ -357,10 +350,10 @@ export class S3FileScanCat {
             Key: key,
         }
         let response: AWS.Response<AWS.S3.PutObjectAclOutput, AWS.AWSError>
-        try{
+        try {
             const s3 = new AWS.S3()
             response = (await s3.putObject(object).promise()).$response
-        } catch(e) {
+        } catch (e) {
             this.log(LogLevel.Error, `Failed to save object to S3: ${key}`)
             throw e
         }
@@ -397,14 +390,14 @@ export class S3FileScanCat {
                 try {
                     const s3 = new AWS.S3()
                     response = (await s3.listObjectsV2(listObjRequest).promise()).$response
-                } catch(e) {
+                } catch (e) {
                     this.log(LogLevel.Error, `Failed to list objects at prefix ${keyParams.curPrefix}`)
                     throw e
                 }
                 if (response.error) {
                     throw error
                 } else if (response.data && response.data.CommonPrefixes && response.data.CommonPrefixes.length > 0) {
-                    if(response.data.IsTruncated && response.data.NextContinuationToken) {
+                    if (response.data.IsTruncated && response.data.NextContinuationToken) {
                         continuationToken = response.data.NextContinuationToken
                     } else {
                         continuationToken = undefined
@@ -422,8 +415,7 @@ export class S3FileScanCat {
                 } else {
                     throw new Error(`Unexpected empty response from S3. ${JSON.stringify(keyParams)}`)
                 }
-            } while(continuationToken)
-            
+            } while (continuationToken)
         }
         this._s3BuildPrefixListObjectsProcessCount--
     }
@@ -503,7 +495,7 @@ export class S3FileScanCat {
                     this._log.info(logMessage)
                     break
                 case LogLevel.Warn:
-                    this._log.warn(logMessage )
+                    this._log.warn(logMessage)
                     break
                 case LogLevel.Error:
                     this._log.error(logMessage)
