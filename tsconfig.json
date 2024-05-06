@@ -15,7 +15,7 @@
       "node_modules/@types"
     ],
     "types": [
-      "node", "moment"
+      "node"
     ]
   },
   "include": [

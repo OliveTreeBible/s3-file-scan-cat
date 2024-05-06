@@ -1,10 +1,15 @@
 import * as waitUntil from 'async-wait-until'
-import * as AWS from 'aws-sdk'
-import { ListObjectsV2Request } from 'aws-sdk/clients/s3'
 import { error } from 'console'
 import * as moment from 'moment'
 import { Logger, LogLevel } from 'typescript-logging'
 import * as zlib from 'zlib'
+
+import {
+    _Object, CommonPrefix, GetObjectCommand, GetObjectCommandInput, ListObjectsV2Command,
+    ListObjectsV2CommandInput, ListObjectsV2CommandOutput, ListObjectsV2Output, PutObjectCommand,
+    PutObjectCommandInput, PutObjectCommandOutput, S3Client
+} from '@aws-sdk/client-s3'
+import { StreamingBlobPayloadOutputTypes } from '@smithy/types'
 
 import { EmptyPrefixError } from './errors/EmptyPrefixError'
 import {
@@ -14,9 +19,8 @@ import { createLogger } from './utils/logger'
 
 const INFINITE_TIMEOUT = 2147483647 // This is actually 24 days but it is also the largest timeout allowed
 
-type NullableAWSListObjectsResponse = undefined | AWS.Response<AWS.S3.ListObjectsV2Output, AWS.AWSError>
-type NullableAWSObjectList = undefined | AWS.S3.ObjectList
-type NullableAWSListObjectsOutput = undefined | AWS.S3.ListObjectsV2Output
+type NullableAWSObjectList = undefined | _Object[]
+type NullableAWSListObjectsOutput = undefined | ListObjectsV2Output
 type NullableMoment = undefined | moment.Moment
 type NullableString = undefined | string
 
@@ -28,6 +32,7 @@ export class S3FileScanCat {
     private _s3BuildPrefixListObjectsProcessCount: number
     private _s3PrefixListObjectsProcessCount: number
     private _totalPrefixesToProcess: number
+    private _s3Client: S3Client
     private _s3ObjectBodyProcessCount: number
     private _s3ObjectPutProcessCount: number
     private _prefixesProcessedTotal: number
@@ -65,14 +70,13 @@ export class S3FileScanCat {
         this._objectBodyPutLimit = scannerOptions.limits?.objectBodyPutLimit !== undefined ? scannerOptions.limits?.objectBodyPutLimit : 100
         this._maxFileSizeBytes = scannerOptions.limits?.maxFileSizeBytes !== undefined ? scannerOptions.limits?.maxFileSizeBytes : 128 * 1024 * 1024
         this._scannerOptions = scannerOptions
-        AWS.config.update({
+        this._s3Client = new S3Client({
             region: 'us-east-1',
-            accessKeyId: awsAccess.accessKeyId,
-            secretAccessKey: awsAccess.secretAccessKey,
+            credentials: {
+                accessKeyId: awsAccess.accessKeyId,
+                secretAccessKey: awsAccess.secretAccessKey,
+            }
         })
-        AWS.config.apiVersions = {
-            s3: '2006-03-01',
-        }
     }
 
     get s3BuildPrefixListObjectsProcessCount(): number {
@@ -163,7 +167,7 @@ export class S3FileScanCat {
             continuationToken: undefined,
             fileNumber: 0,
         }
-        const listObjRequest: ListObjectsV2Request = {
+        const listObjRequest: ListObjectsV2CommandInput = {
             Bucket: bucket,
             Prefix: prefix.endsWith('/') ? prefix : `${prefix}/`,
             MaxKeys: this._objectFetchBatchSize,
@@ -179,83 +183,75 @@ export class S3FileScanCat {
                 INFINITE_TIMEOUT
             )
             this._s3PrefixListObjectsProcessCount++
-            let response: AWS.Response<AWS.S3.ListObjectsV2Output, AWS.AWSError>
+            let response: ListObjectsV2CommandOutput
             try {
-                const s3 = new AWS.S3()
-                response = (await s3.listObjectsV2(listObjRequest).promise()).$response
+                response = await this._s3Client.send(new ListObjectsV2Command(listObjRequest))
             } catch (e) {
                 this.log(LogLevel.Error, `Failed to list objects for ${listObjRequest.Prefix}, Error: ${e}`)
                 throw e
             }
-
-            if (response.error) {
-                throw error
-            } else if (response.data) {
-                let data: NullableAWSListObjectsOutput = response.data
-                if (data.Contents) {
-                    let contents: NullableAWSObjectList = data.Contents
-                    if (data.IsTruncated === true && data.NextContinuationToken !== undefined) {
-                        concatState.continuationToken = data.NextContinuationToken
+            if (response.Contents) {
+                let contents: NullableAWSObjectList = response.Contents
+                if (response.IsTruncated === true && response.NextContinuationToken !== undefined) {
+                    concatState.continuationToken = response.NextContinuationToken
+                } else {
+                    concatState.continuationToken = undefined
+                }
+                let objectBodyPromises: undefined | Promise<StreamingBlobPayloadOutputTypes>[] = []
+                for (const s3Object of contents) {
+                    if (s3Object.Size && s3Object.Key) {
+                        objectBodyPromises.push(this._getObjectBody(bucket, s3Object.Key))
+                    } else if (s3Object.Size === 0) {
+                        this.log(LogLevel.Warn, `S3 Object had zero size ${JSON.stringify(s3Object.Key)}`)
                     } else {
-                        concatState.continuationToken = undefined
+                        throw new Error('Invalid S3 Object encountered.')
                     }
-                    data = undefined
-                    let objectBodyPromises: undefined | Promise<AWS.S3.Body>[] = []
-                    for (const s3Object of contents) {
-                        if (s3Object.Size && s3Object.Key) {
-                            objectBodyPromises.push(this._getObjectBody(bucket, s3Object.Key))
-                        } else if (s3Object.Size === 0) {
-                            this.log(LogLevel.Warn, `S3 Object had zero size ${JSON.stringify(s3Object.Key)}`)
-                        } else {
-                            throw new Error('Invalid S3 Object encountered.')
-                        }
-                    }
-                    contents = undefined
+                }
+                contents = undefined
 
-                    const objectBodies = await Promise.all(objectBodyPromises)
-                    objectBodyPromises = undefined
+                const objectBodies = await Promise.all(objectBodyPromises)
+                objectBodyPromises = undefined
 
-                    objectBodies.forEach((objectBody) => {
-                        let objectBodyStr: string
-                        if (typeof objectBody !== 'string') {
-                            objectBodyStr = objectBody.toString()
-                        } else {
-                            objectBodyStr = objectBody
-                        }
-                        if (objectBodyStr.length > 0) {
-                            if (
-                                concatState.buffer &&
-                                concatState.buffer.length + objectBodyStr.length >
-                                    this._maxFileSizeBytes
-                            ) {
-                                this._flushBuffer(
-                                    bucket,
-                                    concatState.buffer,
-                                    prefix,
-                                    srcPrefix,
-                                    destPrefix,
-                                    concatState.fileNumber++
-                                )
-                                concatState.buffer = undefined
-                            }
-                            if (concatState.buffer) {
-                                concatState.buffer += '\n' + objectBodyStr
-                            } else {
-                                concatState.buffer = objectBodyStr
-                            }
-                        }
-                    })
-                    if (!concatState.continuationToken && concatState.buffer && concatState.buffer.length > 0) {
-                        this._flushBuffer(
-                            bucket,
-                            concatState.buffer,
-                            prefix,
-                            srcPrefix,
-                            destPrefix,
-                            concatState.fileNumber++
-                        )
-                        concatState.buffer = undefined
+                objectBodies.forEach((objectBody) => {
+                    let objectBodyStr: string
+                    if (typeof objectBody !== 'string') {
+                        objectBodyStr = objectBody.toString()
+                    } else {
+                        objectBodyStr = objectBody
                     }
+                    if (objectBodyStr.length > 0) {
+                        if (
+                            concatState.buffer &&
+                            concatState.buffer.length + objectBodyStr.length >
+                                this._maxFileSizeBytes
+                        ) {
+                            this._flushBuffer(
+                                bucket,
+                                concatState.buffer,
+                                prefix,
+                                srcPrefix,
+                                destPrefix,
+                                concatState.fileNumber++
+                            )
+                            concatState.buffer = undefined
+                        }
+                        if (concatState.buffer) {
+                            concatState.buffer += '\n' + objectBodyStr
+                        } else {
+                            concatState.buffer = objectBodyStr
+                        }
+                    }
+                })
+                if (!concatState.continuationToken && concatState.buffer && concatState.buffer.length > 0) {
+                    this._flushBuffer(
+                        bucket,
+                        concatState.buffer,
+                        prefix,
+                        srcPrefix,
+                        destPrefix,
+                        concatState.fileNumber++
+                    )
+                    concatState.buffer = undefined
                 }
             } else {
                 throw new Error(`Unexpected Error: List S3 Objects request had missing response.`)
@@ -266,10 +262,10 @@ export class S3FileScanCat {
         this._prefixesProcessedTotal++
     }
 
-    async _getObjectBody(bucket: string, s3Key: AWS.S3.ObjectKey): Promise<AWS.S3.Body> {
+    async _getObjectBody(bucket: string, s3Key: string): Promise<StreamingBlobPayloadOutputTypes> {
         this.log(LogLevel.Trace, `BEGIN _getObjectBody objectKey=${s3Key}`)
-        let body: AWS.S3.Body = ''
-        const getObjectRequest: AWS.S3.Types.GetObjectRequest = {
+        let body: StreamingBlobPayloadOutputTypes
+        const getObjectRequest: GetObjectCommandInput = {
             Bucket: bucket,
             Key: s3Key,
         }
@@ -280,10 +276,9 @@ export class S3FileScanCat {
         // With exponential backoff the last retry waits ~13 minutes.  This gives the system a chance to recover after a failure but also allows us to move on if we can resolve this in a reasonable amount of time
         const MAX_RETRIES = 14
         let lastError: unknown
-        const s3 = new AWS.S3()
         while (!response) {
             try {
-                response = (await s3.getObject(getObjectRequest).promise()).$response
+                response = await this._s3Client.send(new GetObjectCommand(getObjectRequest))
                 lastError = undefined
             } catch (error) {
                 console.log(`[ERROR] S3 getObjectFailed: ${error}`)
@@ -298,15 +293,11 @@ export class S3FileScanCat {
 
         this._s3ObjectBodyProcessCount--
         if (response === undefined) {
-            console.log(`[ERROR]: Unexpected S3 getObject error encountered ${s3Key}:${lastError ? lastError : ''}`)
-        } else if (response.error) {
-            console.log(`[ERROR]: S3 getObject error encountered ${response.error}`)
-        } else if (!response.data) {
-            console.log(`[ERROR]: Missing response data for object ${s3Key}`)
-        } else if (!response.data.Body) {
-            console.log(`[ERROR]: Missing response data for object ${s3Key}`)
+            throw new Error(`[ERROR]: Unexpected S3 getObject error encountered ${s3Key}:${lastError ? lastError : ''}`)
+        } else if (!response.Body) {
+            throw new Error(`[ERROR]: Missing response data for object ${s3Key}`)
         } else {
-            body = response.data.Body
+            body = response.Body
         }
         this._s3ObjectsFetchedTotal++
         return body
@@ -344,23 +335,19 @@ export class S3FileScanCat {
         this._s3ObjectPutProcessCount++
 
         const body = zlib.gzipSync(buffer)
-        const object: AWS.S3.Types.PutObjectRequest = {
+        const object: PutObjectCommandInput = {
             Body: body,
             Bucket: bucket,
             Key: key,
         }
-        let response: AWS.Response<AWS.S3.PutObjectAclOutput, AWS.AWSError>
+        let response: PutObjectCommandOutput
         try {
-            const s3 = new AWS.S3()
-            response = (await s3.putObject(object).promise()).$response
+            response = await this._s3Client.send(new PutObjectCommand(object))
         } catch (e) {
             this.log(LogLevel.Error, `Failed to save object to S3: ${key}`)
             throw e
         }
         this._s3ObjectPutProcessCount--
-        if (response.error) {
-            throw response.error
-        }
         this._s3ObjectsPutTotal++
         this.log(LogLevel.Trace, `END _saveToS3 key=${key}`)
     }
@@ -378,7 +365,7 @@ export class S3FileScanCat {
                 keyParams.curPrefix += this._delimeter
             }
 
-            const listObjRequest: ListObjectsV2Request = {
+            const listObjRequest: ListObjectsV2CommandInput = {
                 Bucket: keyParams.bucket,
                 Prefix: keyParams.curPrefix,
                 Delimiter: this._delimeter,
@@ -386,23 +373,20 @@ export class S3FileScanCat {
             let continuationToken: undefined | string
             do {
                 listObjRequest.ContinuationToken = continuationToken
-                let response: AWS.Response<AWS.S3.ListObjectsV2Output, AWS.AWSError>
+                let response: ListObjectsV2CommandOutput
                 try {
-                    const s3 = new AWS.S3()
-                    response = (await s3.listObjectsV2(listObjRequest).promise()).$response
+                    response = await this._s3Client.send(new ListObjectsV2Command(listObjRequest))
                 } catch (e) {
                     this.log(LogLevel.Error, `Failed to list objects at prefix ${keyParams.curPrefix}`)
                     throw e
                 }
-                if (response.error) {
-                    throw error
-                } else if (response.data && response.data.CommonPrefixes && response.data.CommonPrefixes.length > 0) {
-                    if (response.data.IsTruncated && response.data.NextContinuationToken) {
-                        continuationToken = response.data.NextContinuationToken
+                if (response.CommonPrefixes && response.CommonPrefixes.length > 0) {
+                    if (response.IsTruncated && response.NextContinuationToken) {
+                        continuationToken = response.NextContinuationToken
                     } else {
                         continuationToken = undefined
                     }
-                    response.data.CommonPrefixes.forEach((commonPrefix) => {
+                    response.CommonPrefixes.forEach((commonPrefix) => {
                         const prefixEval = this._evaluatePrefix(keyParams, commonPrefix, curPart)
                         if (prefixEval.partition) {
                             this._allPrefixes.push(prefixEval.partition)
@@ -507,7 +491,7 @@ export class S3FileScanCat {
         }
     }
 
-    _evaluatePrefix(keyParams: PrefixParams, commonPrefix: AWS.S3.CommonPrefix, curPart: string): PrefixEvalResult {
+    _evaluatePrefix(keyParams: PrefixParams, commonPrefix: CommonPrefix, curPart: string): PrefixEvalResult {
         this.log(LogLevel.Trace, `_keysForPrefix ${keyParams.curPrefix}`)
         const result: PrefixEvalResult = {}
         if (commonPrefix.Prefix) {
