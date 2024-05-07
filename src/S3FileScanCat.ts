@@ -161,7 +161,7 @@ export class S3FileScanCat {
     }
 
     async concatFilesAtPrefix(bucket: string, prefix: string, srcPrefix: string, destPrefix: string): Promise<void> {
-        this.log(LogLevel.Info, `BEGIN _concatFilesAtPrefix prefix=${prefix}`)
+        this.log(LogLevel.Trace, `BEGIN _concatFilesAtPrefix prefix=${prefix}`)
         const concatState: ConcatState = {
             buffer: undefined,
             continuationToken: undefined,
@@ -185,6 +185,7 @@ export class S3FileScanCat {
             this._s3PrefixListObjectsProcessCount++
             let response: ListObjectsV2CommandOutput
             try {
+                this.log(LogLevel.Debug, `STATUS _concatFilesAtPrefix prefix=${prefix} - this._s3PrefixListObjectsProcessCount: ${this._s3PrefixListObjectsProcessCount}`)
                 response = await this._s3Client.send(new ListObjectsV2Command(listObjRequest))
             } catch (e) {
                 this.log(LogLevel.Error, `Failed to list objects for ${listObjRequest.Prefix}, Error: ${e}`)
@@ -257,8 +258,9 @@ export class S3FileScanCat {
                 throw new Error(`Unexpected Error: List S3 Objects request had missing response.`)
             }
             this._s3PrefixListObjectsProcessCount--
+            this.log(LogLevel.Debug, `STATUS _concatFilesAtPrefix prefix=${prefix} - this._s3PrefixListObjectsProcessCount: ${this._s3PrefixListObjectsProcessCount}`)
         } while (concatState.continuationToken)
-        this.log(LogLevel.Info, `END _concatFilesAtPrefix prefix=${prefix}`)
+        this.log(LogLevel.Trace, `END _concatFilesAtPrefix prefix=${prefix}`)
         this._prefixesProcessedTotal++
     }
 
@@ -271,6 +273,7 @@ export class S3FileScanCat {
         }
         await waitUntil(() => this._s3ObjectBodyProcessCount < this._objectBodyFetchLimit, INFINITE_TIMEOUT)
         this._s3ObjectBodyProcessCount++
+        this.log(LogLevel.Debug, `STATUS _getObjectBody s3Key=${s3Key} - this._s3ObjectBodyProcessCount: ${this._s3ObjectBodyProcessCount}`)
         let response
         let retryCount = 0
         // With exponential backoff the last retry waits ~13 minutes.  This gives the system a chance to recover after a failure but also allows us to move on if we can resolve this in a reasonable amount of time
@@ -292,6 +295,7 @@ export class S3FileScanCat {
         }
 
         this._s3ObjectBodyProcessCount--
+        this.log(LogLevel.Debug, `STATUS _getObjectBody s3Key=${s3Key} - this._s3ObjectBodyProcessCount: ${this._s3ObjectBodyProcessCount}`)
         if (response === undefined) {
             throw new Error(`[ERROR]: Unexpected S3 getObject error encountered ${s3Key}:${lastError ? lastError : ''}`)
         } else if (!response.Body) {
@@ -300,6 +304,7 @@ export class S3FileScanCat {
             body = response.Body
         }
         this._s3ObjectsFetchedTotal++
+        this.log(LogLevel.Trace, `END _getObjectBody objectKey=${s3Key}`)
         return body
     }
 
@@ -326,6 +331,7 @@ export class S3FileScanCat {
         this.log(LogLevel.Trace, `BEGIN _flushBuffer destination=${destPrefix}`)
         const fileName = `${prefix.replace(srcPrefix, destPrefix)}/${fileNumber}.json.gz`
         await this._saveToS3(bucket, buffer, fileName)
+        this.log(LogLevel.Trace, `END _flushBuffer destination=${destPrefix}`)
     }
 
     async _saveToS3(bucket: string, buffer: string, key: string): Promise<void> {
