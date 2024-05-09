@@ -52,11 +52,8 @@ Breaking these three sections into two JSON files is recommended.  One files con
       "part-05"
     ],
     "limits" : {
-      "maxBuildPrefixList":   100,
-      "prefixListObjectsLimit": 100,
-      "objectFetchBatchSize":        200,
-      "objectBodyFetchLimit":   300,
-      "objectBodyPutLimit":         250,
+      "scanPrefixForPartitionsProcessLimit":   100,
+      "s3ObjectBodyProcessInProgressLimit":   300,
       "minPercentRamFree":    25.0,
       "maxFileSizeBytes": 134217728
     },
