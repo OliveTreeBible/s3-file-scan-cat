@@ -9,7 +9,6 @@ import {
     ListObjectsV2CommandInput, ListObjectsV2CommandOutput, ListObjectsV2Output, PutObjectCommand,
     PutObjectCommandInput, PutObjectCommandOutput, S3Client
 } from '@aws-sdk/client-s3'
-import { StreamingBlobPayloadOutputTypes } from '@smithy/types'
 
 import { EmptyPrefixError } from './errors/EmptyPrefixError'
 import {
@@ -254,7 +253,6 @@ export class S3FileScanCat {
     async _getAndProcessObjectBody(bucket: string, s3Key: string, concatState: ConcatState, prefix: string, srcPrefix: string, destPrefix: string): Promise<void> {
         this._s3ObjectBodyProcessInProgress++
         this.log(LogLevel.Trace, `BEGIN _getObjectBody objectKey=${s3Key} - _s3ObjectBodyProcessCount: ${this._s3ObjectBodyProcessInProgress}`)
-        let objectBody: StreamingBlobPayloadOutputTypes
         let response: undefined | GetObjectCommandOutput
         let retryCount = 0
         // With exponential backoff the last retry waits ~13 minutes.  This gives the system a chance to recover after a failure but also allows us to move on if we can resolve this in a reasonable amount of time
@@ -284,15 +282,9 @@ export class S3FileScanCat {
         } else if (!response.Body) {
             throw new Error(`[ERROR]: Missing response data for object ${s3Key}`)
         } 
-        objectBody = response.Body
+        const objectBodyStr = await response.Body.transformToString()
         this._s3ObjectsFetchedTotal++
-        
-        let objectBodyStr: string
-        if (typeof objectBody !== 'string') {
-            objectBodyStr = objectBody.toString()
-        } else {
-            objectBodyStr = objectBody
-        }
+
         if (objectBodyStr.length > 0) {
             if (
                 concatState.buffer &&
