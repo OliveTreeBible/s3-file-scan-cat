@@ -23,11 +23,8 @@ export interface LoggerOptions {
 }
 
 export interface ScannerLimits {
-    maxBuildPrefixList: number
-    prefixListObjectsLimit: number
-    objectFetchBatchSize: number
-    objectBodyFetchLimit: number
-    objectBodyPutLimit: number
+    scanPrefixForPartitionsProcessLimit: number
+    s3ObjectBodyProcessInProgressLimit: number
     maxFileSizeBytes: number
 }
 
