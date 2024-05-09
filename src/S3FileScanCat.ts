@@ -133,7 +133,7 @@ export class S3FileScanCat {
                     if(this._scanPrefixForPartitionsProcessCount < this._scannerOptions.limits.scanPrefixForPartitionsProcessLimit) {
                         return true
                     } else if(waits++ % 20 === 0) {
-                        this.log(LogLevel.Trace, `Waiting on ListObjects to complete prefix=${srcPrefix} `)
+                        this.log(LogLevel.Debug, `Waiting on ListObjects to complete prefix=${srcPrefix} `)
                     }
                 },
                 { timeout: WAIT_FOREVER }
@@ -183,7 +183,7 @@ export class S3FileScanCat {
             this._s3PrefixListObjectsProcessCount++
             let response: ListObjectsV2CommandOutput
             try {
-                this.log(LogLevel.Debug, `STATUS _concatFilesAtPrefix prefix=${prefix} - this._s3PrefixListObjectsProcessCount: ${this._s3PrefixListObjectsProcessCount}`)
+                this.log(LogLevel.Trace, `STATUS _concatFilesAtPrefix prefix=${prefix} - this._s3PrefixListObjectsProcessCount: ${this._s3PrefixListObjectsProcessCount}`)
                 response = await this._s3Client.send(new ListObjectsV2Command(listObjRequest))
             } catch (e) {
                 this.log(LogLevel.Error, `Failed to list objects for ${listObjRequest.Prefix}, Error: ${e}`)
@@ -221,7 +221,7 @@ export class S3FileScanCat {
                 throw new Error(`Unexpected Error: List S3 Objects request had missing response.`)
             }
             this._s3PrefixListObjectsProcessCount--
-            this.log(LogLevel.Debug, `STATUS _concatFilesAtPrefix prefix=${prefix} - _s3PrefixListObjectsProcessCount: ${this._s3PrefixListObjectsProcessCount}`)
+            this.log(LogLevel.Trace, `STATUS _concatFilesAtPrefix prefix=${prefix} - _s3PrefixListObjectsProcessCount: ${this._s3PrefixListObjectsProcessCount}`)
         } while (concatState.continuationToken)
         // Finally wait until all the objects have been fetched and processed
         await waitUntil(
@@ -269,7 +269,7 @@ export class S3FileScanCat {
                 console.log(`[ERROR] S3 getObjectFailed: ${error}`)
                 lastError = error
                 if (retryCount < MAX_RETRIES) {
-                    this.log(LogLevel.Debug, `STATUS RETRY! _getAndProcessObjectBody s3Key=${s3Key} - _s3ObjectBodyProcessCount: ${this._s3ObjectBodyProcessInProgress} - retryCount: ${retryCount}`)
+                    this.log(LogLevel.Warn, `STATUS RETRY! _getAndProcessObjectBody s3Key=${s3Key} - _s3ObjectBodyProcessCount: ${this._s3ObjectBodyProcessInProgress} - retryCount: ${retryCount}`)
                     await this._sleep(this._getWaitTimeForRetry(retryCount++))
                 } else {
                     break
