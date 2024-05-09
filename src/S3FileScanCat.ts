@@ -269,7 +269,7 @@ export class S3FileScanCat {
                 console.log(`[ERROR] S3 getObjectFailed: ${error}`)
                 lastError = error
                 if (retryCount < MAX_RETRIES) {
-                    this.log(LogLevel.Debug, `STATUS RETRY! _getObjectBody s3Key=${s3Key} - this._s3ObjectBodyProcessCount: ${this._s3ObjectBodyProcessInProgress} - retryCount: ${retryCount}`)
+                    this.log(LogLevel.Debug, `STATUS RETRY! _getAndProcessObjectBody s3Key=${s3Key} - _s3ObjectBodyProcessCount: ${this._s3ObjectBodyProcessInProgress} - retryCount: ${retryCount}`)
                     await this._sleep(this._getWaitTimeForRetry(retryCount++))
                 } else {
                     break
