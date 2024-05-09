@@ -43,7 +43,7 @@ Breaking these three sections into two JSON files is recommended.  One files con
     }
   },
   "scanner": {
-    "logLevel": 4,
+    "logLevel": "info",
     "partitionStack" : [
       "year",
       "month",
@@ -52,9 +52,8 @@ Breaking these three sections into two JSON files is recommended.  One files con
       "part-05"
     ],
     "limits" : {
-      "scanPrefixForPartitionsProcessLimit":   100,
-      "s3ObjectBodyProcessInProgressLimit":   300,
-      "minPercentRamFree":    25.0,
+      "scanPrefixForPartitionsProcessLimit": 10
+      "s3ObjectBodyProcessInProgressLimit": 500
       "maxFileSizeBytes": 134217728
     },
     "bounds": {
