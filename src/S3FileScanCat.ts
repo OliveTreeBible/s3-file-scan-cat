@@ -22,7 +22,7 @@ type NullableAWSObjectList = undefined | _Object[]
 type NullableAWSListObjectsOutput = undefined | ListObjectsV2Output
 type NullableMoment = undefined | moment.Moment
 type NullableString = undefined | string
-const MAX_LIST_KEYS = 100
+const MAX_LIST_KEYS = 1000
 export class S3FileScanCat {
     private _log?: Logger
     private _delimeter: string
@@ -106,7 +106,7 @@ export class S3FileScanCat {
         return this._isDone
     }
 
-    async scanAndProcessFiles(bucket: string, srcPrefix: string, destPrefix: string): Promise<void> {
+    async scanAndProcessFiles(bucket: string, useAccelerateEndpoint: boolean, srcPrefix: string, destPrefix: string): Promise<void> {
         this.log(
             LogLevel.Trace,
             `BEGIN scanConcatenateCopy srcPrefix=${srcPrefix}:destPrefix=${destPrefix}:partitionStack=${this._scannerOptions.partitionStack}`
@@ -115,6 +115,7 @@ export class S3FileScanCat {
 
         this._keyParams.push({
             bucket,
+            useAccelerateEndpoint,
             prefix: srcPrefix,
             curPrefix: srcPrefix /* This changes as we traverse down the path, srcPrefix is where we start */,
             partitionStack: this._scannerOptions.partitionStack,
@@ -141,7 +142,7 @@ export class S3FileScanCat {
             while (this._allPrefixes.length > 0) {
                 const prefix = this._allPrefixes.shift()
                 if (prefix) {
-                    await this.concatFilesAtPrefix(bucket, prefix, srcPrefix, destPath)
+                    await this.concatFilesAtPrefix(bucket, useAccelerateEndpoint, prefix, srcPrefix, destPath)
                 }
             }
         } else {
@@ -154,7 +155,7 @@ export class S3FileScanCat {
         this._isDone = true
     }
 
-    async concatFilesAtPrefix(bucket: string, prefix: string, srcPrefix: string, destPrefix: string): Promise<void> {
+    async concatFilesAtPrefix(bucket: string, useAccelerateEndpoint: boolean, prefix: string, srcPrefix: string, destPrefix: string): Promise<void> {
         this.log(LogLevel.Trace, `BEGIN _concatFilesAtPrefix prefix=${prefix}`)
         let waits = 0
         const concatState: ConcatState = {
@@ -174,7 +175,8 @@ export class S3FileScanCat {
                 credentials: {
                     accessKeyId: this._awsAccess.accessKeyId,
                     secretAccessKey: this._awsAccess.secretAccessKey,
-                }
+                },
+                useAccelerateEndpoint
             })
             if (concatState.continuationToken) {
                 listObjRequest.ContinuationToken = concatState.continuationToken
@@ -210,7 +212,7 @@ export class S3FileScanCat {
                             { timeout: WAIT_FOREVER }
                         )
                         // We purposely do not await on this - the awaitUntil above limits the number of these calls that are in progress at any given moment.
-                        this._getAndProcessObjectBody(bucket, s3Object.Key, concatState, prefix, srcPrefix, destPrefix)
+                        this._getAndProcessObjectBody(bucket, useAccelerateEndpoint, s3Object.Key, concatState, prefix, srcPrefix, destPrefix)
                     } else if (s3Object.Size === 0) {
                         this.log(LogLevel.Warn, `S3 Object had zero size ${JSON.stringify(s3Object.Key)}`)
                     } else {
@@ -240,6 +242,7 @@ export class S3FileScanCat {
         if (!concatState.continuationToken && concatState.buffer && concatState.buffer.length > 0) {
             this._flushBuffer(
                 bucket,
+                useAccelerateEndpoint,
                 concatState.buffer,
                 prefix,
                 srcPrefix,
@@ -252,7 +255,7 @@ export class S3FileScanCat {
         this._prefixesProcessedTotal++
     }
 
-    async _getAndProcessObjectBody(bucket: string, s3Key: string, concatState: ConcatState, prefix: string, srcPrefix: string, destPrefix: string): Promise<void> {
+    async _getAndProcessObjectBody(bucket: string, useAccelerateEndpoint: boolean, s3Key: string, concatState: ConcatState, prefix: string, srcPrefix: string, destPrefix: string): Promise<void> {
         this._s3ObjectBodyProcessInProgress++
         this.log(LogLevel.Trace, `BEGIN _getObjectBody objectKey=${s3Key} - _s3ObjectBodyProcessCount: ${this._s3ObjectBodyProcessInProgress}`)
         const s3Client = new S3Client({
@@ -260,7 +263,8 @@ export class S3FileScanCat {
             credentials: {
                 accessKeyId: this._awsAccess.accessKeyId,
                 secretAccessKey: this._awsAccess.secretAccessKey,
-            }
+            },
+            useAccelerateEndpoint
         })
         let response: undefined | GetObjectCommandOutput
         let retryCount = 0
@@ -304,6 +308,7 @@ export class S3FileScanCat {
             ) {
                 this._flushBuffer(
                     bucket,
+                    useAccelerateEndpoint,
                     concatState.buffer,
                     prefix,
                     srcPrefix,
@@ -336,6 +341,7 @@ export class S3FileScanCat {
 
     async _flushBuffer(
         bucket: string,
+        useAccelerateEndpoint: boolean,
         buffer: string,
         prefix: string,
         srcPrefix: string,
@@ -344,11 +350,11 @@ export class S3FileScanCat {
     ) {
         this.log(LogLevel.Trace, `BEGIN _flushBuffer destination=${destPrefix}`)
         const fileName = `${prefix.replace(srcPrefix, destPrefix)}/${fileNumber}.json.gz`
-        await this._saveToS3(bucket, buffer, fileName)
+        await this._saveToS3(bucket, useAccelerateEndpoint, buffer, fileName)
         this.log(LogLevel.Trace, `END _flushBuffer destination=${destPrefix}`)
     }
 
-    async _saveToS3(bucket: string, buffer: string, key: string): Promise<void> {
+    async _saveToS3(bucket: string, useAccelerateEndpoint: boolean, buffer: string, key: string): Promise<void> {
         this.log(LogLevel.Trace, `BEGIN _saveToS3 key=${key} - _s3ObjectPutProcessCount: ${this._s3ObjectPutProcessCount}`)
 
         this._s3ObjectPutProcessCount++
@@ -365,7 +371,8 @@ export class S3FileScanCat {
             credentials: {
                 accessKeyId: this._awsAccess.accessKeyId,
                 secretAccessKey: this._awsAccess.secretAccessKey,
-            }
+            },
+            useAccelerateEndpoint
         })
         try {
             response = await s3Client.send(new PutObjectCommand(object))
@@ -403,7 +410,8 @@ export class S3FileScanCat {
                 credentials: {
                     accessKeyId: this._awsAccess.accessKeyId,
                     secretAccessKey: this._awsAccess.secretAccessKey,
-                }
+                },
+                useAccelerateEndpoint: keyParams.useAccelerateEndpoint
             })
             do {
                 listObjRequest.ContinuationToken = continuationToken
@@ -539,6 +547,7 @@ export class S3FileScanCat {
                         const partitionStackClone = Object.assign([], keyParams.partitionStack)
                         result.keyParams = {
                             bucket: keyParams.bucket,
+                            useAccelerateEndpoint: keyParams.useAccelerateEndpoint,
                             prefix: keyParams.prefix,
                             curPrefix: nextPart,
                             partitionStack: partitionStackClone,

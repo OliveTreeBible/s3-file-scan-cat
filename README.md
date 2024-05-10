@@ -75,7 +75,7 @@ const awsSecrets = JSON.parse(fs.readFileSync('./config/private/secrets.json').t
 
 const s3Scanner = new S3FileScanCat(scannerConfig.scanner, awsSecrets)
 s3Scanner
-    .scanAndProcessFiles(scannerConfig.aws.s3.bucket, scannerConfig.aws.s3.scannerPrefix, scannerConfig.aws.s3.destinationPrefix)
+    .scanAndProcessFiles(scannerConfig.aws.s3.bucket, scannerConfig.aws.s3.useAccelerateEndpoint, scannerConfig.aws.s3.scannerPrefix, scannerConfig.aws.s3.destinationPrefix)
     .then(() => {
         process.exit(0)
     })

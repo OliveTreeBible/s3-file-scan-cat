@@ -34,12 +34,14 @@ export interface AWSConfig {
 
 export interface AWSS3Config {
     bucket: string
+    useAccelerateEndpoint: boolean
     scannerPrefix: string
     destinationPrefix: string
 }
 
 export interface PrefixParams {
     bucket: string
+    useAccelerateEndpoint: boolean
     prefix: string
     curPrefix: string
     partitionStack: string[]
