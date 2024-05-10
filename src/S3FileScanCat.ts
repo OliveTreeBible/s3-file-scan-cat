@@ -31,7 +31,6 @@ export class S3FileScanCat {
     private _scanPrefixForPartitionsProcessCount: number
     private _s3PrefixListObjectsProcessCount: number
     private _totalPrefixesToProcess: number
-    private _s3Client: S3Client
     private _s3ObjectBodyProcessInProgress: number
     private _s3ObjectPutProcessCount: number
     private _prefixesProcessedTotal: number
@@ -41,6 +40,7 @@ export class S3FileScanCat {
     private _s3ObjectBodyProcessInProgressLimit: number
     private _maxFileSizeBytes: number
     private _scannerOptions: ScannerOptions
+    private _awsAccess: AWSSecrets
     constructor(scannerOptions: ScannerOptions, awsAccess: AWSSecrets) {
         if (scannerOptions.logOptions)
             this._log = createLogger(
@@ -63,13 +63,7 @@ export class S3FileScanCat {
         this._s3ObjectBodyProcessInProgressLimit = scannerOptions.limits?.s3ObjectBodyProcessInProgressLimit !== undefined ? scannerOptions.limits?.s3ObjectBodyProcessInProgressLimit : 100
         this._maxFileSizeBytes = scannerOptions.limits?.maxFileSizeBytes !== undefined ? scannerOptions.limits?.maxFileSizeBytes : 128 * 1024 * 1024
         this._scannerOptions = scannerOptions
-        this._s3Client = new S3Client({
-            region: 'us-east-1',
-            credentials: {
-                accessKeyId: awsAccess.accessKeyId,
-                secretAccessKey: awsAccess.secretAccessKey,
-            }
-        })
+        this._awsAccess = awsAccess
     }
 
     get s3BuildPrefixListObjectsProcessCount(): number {
@@ -175,6 +169,13 @@ export class S3FileScanCat {
             MaxKeys: MAX_LIST_KEYS,
         }
         do {
+            const s3Client = new S3Client({
+                region: 'us-east-1',
+                credentials: {
+                    accessKeyId: this._awsAccess.accessKeyId,
+                    secretAccessKey: this._awsAccess.secretAccessKey,
+                }
+            })
             if (concatState.continuationToken) {
                 listObjRequest.ContinuationToken = concatState.continuationToken
             } else {
@@ -184,7 +185,7 @@ export class S3FileScanCat {
             let response: ListObjectsV2CommandOutput
             try {
                 this.log(LogLevel.Trace, `STATUS _concatFilesAtPrefix prefix=${prefix} - this._s3PrefixListObjectsProcessCount: ${this._s3PrefixListObjectsProcessCount}`)
-                response = await this._s3Client.send(new ListObjectsV2Command(listObjRequest))
+                response = await s3Client.send(new ListObjectsV2Command(listObjRequest))
             } catch (e) {
                 this.log(LogLevel.Error, `Failed to list objects for ${listObjRequest.Prefix}, Error: ${e}`)
                 throw e
@@ -222,6 +223,7 @@ export class S3FileScanCat {
             }
             this._s3PrefixListObjectsProcessCount--
             this.log(LogLevel.Trace, `STATUS _concatFilesAtPrefix prefix=${prefix} - _s3PrefixListObjectsProcessCount: ${this._s3PrefixListObjectsProcessCount}`)
+            s3Client.destroy()
         } while (concatState.continuationToken)
         // Finally wait until all the objects have been fetched and processed
         await waitUntil(
@@ -253,6 +255,13 @@ export class S3FileScanCat {
     async _getAndProcessObjectBody(bucket: string, s3Key: string, concatState: ConcatState, prefix: string, srcPrefix: string, destPrefix: string): Promise<void> {
         this._s3ObjectBodyProcessInProgress++
         this.log(LogLevel.Trace, `BEGIN _getObjectBody objectKey=${s3Key} - _s3ObjectBodyProcessCount: ${this._s3ObjectBodyProcessInProgress}`)
+        const s3Client = new S3Client({
+            region: 'us-east-1',
+            credentials: {
+                accessKeyId: this._awsAccess.accessKeyId,
+                secretAccessKey: this._awsAccess.secretAccessKey,
+            }
+        })
         let response: undefined | GetObjectCommandOutput
         let retryCount = 0
         // With exponential backoff the last retry waits ~13 minutes.  This gives the system a chance to recover after a failure but also allows us to move on if we can resolve this in a reasonable amount of time
@@ -260,7 +269,7 @@ export class S3FileScanCat {
         let lastError: unknown
         while (!response) {
             try {
-                response = await this._s3Client.send(new GetObjectCommand({
+                response = await s3Client.send(new GetObjectCommand({
                     Bucket: bucket,
                     Key: s3Key,
                 }))
@@ -282,6 +291,8 @@ export class S3FileScanCat {
         } else if (!response.Body) {
             throw new Error(`[ERROR]: Missing response data for object ${s3Key}`)
         } 
+        // We need to destroy the s3Client once the Body is done reading.
+        response.Body.on('finished', () => s3Client.destroy());
         const objectBodyStr = await response.Body.transformToString()
         this._s3ObjectsFetchedTotal++
 
@@ -349,8 +360,16 @@ export class S3FileScanCat {
             Key: key,
         }
         let response: PutObjectCommandOutput
+        const s3Client = new S3Client({
+            region: 'us-east-1',
+            credentials: {
+                accessKeyId: this._awsAccess.accessKeyId,
+                secretAccessKey: this._awsAccess.secretAccessKey,
+            }
+        })
         try {
-            response = await this._s3Client.send(new PutObjectCommand(object))
+            response = await s3Client.send(new PutObjectCommand(object))
+            s3Client.destroy()
         } catch (e) {
             this.log(LogLevel.Error, `Failed to save object to S3: ${key}`)
             throw e
@@ -379,11 +398,18 @@ export class S3FileScanCat {
                 Delimiter: this._delimeter,
             }
             let continuationToken: undefined | string
+            const s3Client = new S3Client({
+                region: 'us-east-1',
+                credentials: {
+                    accessKeyId: this._awsAccess.accessKeyId,
+                    secretAccessKey: this._awsAccess.secretAccessKey,
+                }
+            })
             do {
                 listObjRequest.ContinuationToken = continuationToken
                 let response: ListObjectsV2CommandOutput
                 try {
-                    response = await this._s3Client.send(new ListObjectsV2Command(listObjRequest))
+                    response = await s3Client.send(new ListObjectsV2Command(listObjRequest))
                 } catch (e) {
                     this.log(LogLevel.Error, `Failed to list objects at prefix ${keyParams.curPrefix}`)
                     throw e
@@ -408,6 +434,7 @@ export class S3FileScanCat {
                     throw new Error(`Unexpected empty response from S3. ${JSON.stringify(keyParams)}`)
                 }
             } while (continuationToken)
+            s3Client.destroy()
         }
         this._scanPrefixForPartitionsProcessCount--
     }
