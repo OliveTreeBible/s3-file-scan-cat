@@ -73,9 +73,9 @@ import { AWSSecrets, S3FileScanCat, ScannerConfig } from 's3-file-scan-cat';
 const scannerConfig = JSON.parse(fs.readFileSync('./config/manager_config.json').toString('utf8')) as ScannerConfig
 const awsSecrets = JSON.parse(fs.readFileSync('./config/private/secrets.json').toString('utf8')).aws as AWSSecrets
 
-const s3Scanner = new S3FileScanCat(scannerConfig.scanner, awsSecrets)
+const s3Scanner = new S3FileScanCat(scannerConfig.aws.s3.useAccelerateEndpoint, scannerConfig.scanner, awsSecrets)
 s3Scanner
-    .scanAndProcessFiles(scannerConfig.aws.s3.bucket, scannerConfig.aws.s3.useAccelerateEndpoint, scannerConfig.aws.s3.scannerPrefix, scannerConfig.aws.s3.destinationPrefix)
+    .scanAndProcessFiles(scannerConfig.aws.s3.bucket, scannerConfig.aws.s3.scannerPrefix, scannerConfig.aws.s3.destinationPrefix)
     .then(() => {
         process.exit(0)
     })

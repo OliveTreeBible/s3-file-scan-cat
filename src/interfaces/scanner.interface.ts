@@ -41,7 +41,6 @@ export interface AWSS3Config {
 
 export interface PrefixParams {
     bucket: string
-    useAccelerateEndpoint: boolean
     prefix: string
     curPrefix: string
     partitionStack: string[]
