@@ -1,6 +1,7 @@
 import { WAIT_FOREVER, waitUntil } from 'async-wait-until'
-import { Agent } from 'http'
 import * as moment from 'moment'
+import { Agent as HttpAgent } from 'node:http'
+import { Agent as HttpsAgent } from 'node:https'
 import { Logger, LogLevel } from 'typescript-logging'
 import * as zlib from 'zlib'
 
@@ -76,7 +77,7 @@ export class S3FileScanCat {
             // Use a custom request handler so that we can adjust the HTTPS Agent and
             // socket behavior.
             requestHandler: new NodeHttpHandler({
-                httpsAgent: new Agent({
+                httpsAgent: new HttpsAgent({
                 maxSockets: 500,
 
                 // keepAlive is a default from AWS SDK. We want to preserve this for
@@ -84,7 +85,7 @@ export class S3FileScanCat {
                 keepAlive: true,
                 keepAliveMsecs: 1000,
                 }),
-                httpAgent: new Agent({
+                httpAgent: new HttpAgent({
                     maxSockets: 500,
     
                     // keepAlive is a default from AWS SDK. We want to preserve this for
