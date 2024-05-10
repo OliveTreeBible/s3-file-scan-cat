@@ -84,6 +84,14 @@ export class S3FileScanCat {
                 keepAlive: true,
                 keepAliveMsecs: 1000,
                 }),
+                httpAgent: new Agent({
+                    maxSockets: 500,
+    
+                    // keepAlive is a default from AWS SDK. We want to preserve this for
+                    // performance reasons.
+                    keepAlive: true,
+                    keepAliveMsecs: 1000,
+                    }),
                 socketTimeout: 5000,
             }),
         })
