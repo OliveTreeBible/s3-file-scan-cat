@@ -244,7 +244,7 @@ export class S3FileScanCat {
                 }
                 contents = undefined
             } else {
-                throw new Error(`Unexpected Error: List S3 Objects request had missing response.`)
+                throw new Error(`Unexpected Error: List S3 Objects request had missing response. Request: ${JSON.stringify(listObjRequest)}`)
             }
             this._s3PrefixListObjectsProcessCount--
             this.log(LogLevel.Trace, `STATUS _concatFilesAtPrefix prefix=${prefix} - _s3PrefixListObjectsProcessCount: ${this._s3PrefixListObjectsProcessCount}`)
@@ -389,7 +389,7 @@ export class S3FileScanCat {
 
     async _scanPrefixForPartitions(keyParams: PrefixParams): Promise<void> {
         this._scanPrefixForPartitionsProcessCount++
-        this.log(LogLevel.Trace, `_buildFullPrefixList ${keyParams.curPrefix}::${keyParams.partitionStack}`)
+        this.log(LogLevel.Trace, `_scanPrefixForPartitions ${keyParams.curPrefix}::${keyParams.partitionStack}`)
         if (this._isPrefixInBounds(keyParams)) {
             const curPart = keyParams.partitionStack.shift()
             if (!curPart) {
