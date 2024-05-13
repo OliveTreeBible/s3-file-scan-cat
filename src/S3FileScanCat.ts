@@ -14,7 +14,7 @@ import { NodeHttpHandler } from '@smithy/node-http-handler'
 
 import { EmptyPrefixError } from './errors/EmptyPrefixError'
 import {
-    AWSSecrets, ConcatState, MatchedDate, PrefixEvalResult, PrefixParams, ScannerOptions
+    AWSSecrets, ConcatState, PrefixEvalResult, PrefixParams, ScannerOptions
 } from './interfaces/scanner.interface'
 import { createLogger } from './utils/logger'
 
@@ -144,14 +144,29 @@ export class S3FileScanCat {
             `BEGIN scanConcatenateCopy srcPrefix=${srcPrefix}:destPrefix=${destPrefix}:partitionStack=${this._scannerOptions.partitionStack}`
         )
         const destPath = destPrefix
-
-        this._keyParams.push({
-            bucket,
-            prefix: srcPrefix,
-            curPrefix: srcPrefix /* This changes as we traverse down the path, srcPrefix is where we start */,
-            partitionStack: this._scannerOptions.partitionStack,
-            bounds: this._scannerOptions.bounds,
-        })
+        if(this._scannerOptions.bounds?.startDate && this._scannerOptions.bounds.endDate) {
+            const currDate = moment(this._scannerOptions.bounds.startDate)
+            const endDate = moment(this._scannerOptions.bounds.endDate)
+            while(currDate.isSameOrBefore(endDate)) {
+                this._keyParams.push({
+                    bucket,
+                    prefix: srcPrefix,
+                    curPrefix: `${srcPrefix.endsWith('/')?srcPrefix:srcPrefix+'/'}year=${currDate.format('YYYY')}/month=${currDate.format('MM')}/day=${currDate.format('DD')}` /* This changes as we traverse down the path, srcPrefix is where we start */,
+                    partitionStack: this._scannerOptions.partitionStack,
+                    bounds: this._scannerOptions.bounds,
+                })
+                currDate.add(1, 'day')
+            }
+        } else {
+            this._keyParams.push({
+                bucket,
+                prefix: srcPrefix,
+                curPrefix: srcPrefix /* This changes as we traverse down the path, srcPrefix is where we start */,
+                partitionStack: this._scannerOptions.partitionStack,
+                bounds: this._scannerOptions.bounds,
+            })
+        }
+        
         let waits = 0
         while (this._keyParams.length > 0 || this._scanPrefixForPartitionsProcessCount > 0) {
             await waitUntil(
@@ -390,115 +405,51 @@ export class S3FileScanCat {
     async _scanPrefixForPartitions(keyParams: PrefixParams): Promise<void> {
         this._scanPrefixForPartitionsProcessCount++
         this.log(LogLevel.Trace, `_scanPrefixForPartitions ${keyParams.curPrefix}::${keyParams.partitionStack}`)
-        if (this._isPrefixInBounds(keyParams)) {
-            const curPart = keyParams.partitionStack.shift()
-            if (!curPart) {
-                throw new Error('Unexpected end of partition stack!')
-            }
-
-            if (!keyParams.curPrefix.endsWith(this._delimeter)) {
-                keyParams.curPrefix += this._delimeter
-            }
-
-            const listObjRequest: ListObjectsV2CommandInput = {
-                Bucket: keyParams.bucket,
-                Prefix: keyParams.curPrefix,
-                Delimiter: this._delimeter,
-            }
-            let continuationToken: undefined | string
-            do {
-                listObjRequest.ContinuationToken = continuationToken
-                let response: ListObjectsV2CommandOutput
-                try {
-                    response = await this._s3Client.send(new ListObjectsV2Command(listObjRequest))
-                } catch (e) {
-                    this.log(LogLevel.Error, `Failed to list objects at prefix ${keyParams.curPrefix}`)
-                    throw e
-                }
-                if (response.CommonPrefixes && response.CommonPrefixes.length > 0) {
-                    if (response.IsTruncated && response.NextContinuationToken) {
-                        continuationToken = response.NextContinuationToken
-                    } else {
-                        continuationToken = undefined
-                    }
-                    response.CommonPrefixes.forEach((commonPrefix) => {
-                        const prefixEval = this._evaluatePrefix(keyParams, commonPrefix, curPart)
-                        if (prefixEval.partition) {
-                            this._allPrefixes.push(prefixEval.partition)
-                        } else if (prefixEval.keyParams) {
-                            this._keyParams.push(prefixEval.keyParams)
-                        } else {
-                            throw new Error(`Unexpected partition info encountered. ${JSON.stringify(keyParams)}`)
-                        }
-                    })
-                } else {
-                    throw new Error(`Unexpected empty response from S3. ${JSON.stringify(keyParams)}`)
-                }
-            } while (continuationToken)
+        const curPart = keyParams.partitionStack.shift()
+        if (!curPart) {
+            throw new Error('Unexpected end of partition stack!')
         }
-        this._scanPrefixForPartitionsProcessCount--
-    }
 
-    _isPrefixInBounds(keyParams: PrefixParams) {
-        let inBounds
-        if (keyParams.bounds) {
-            let startDate: NullableMoment = moment(keyParams.bounds.startDate)
-            const [startYear, startMonth, startDay] = startDate.format('YYYY-MM-DD').split('-')
-            startDate = undefined
-            let endDate: NullableMoment = moment(keyParams.bounds.endDate)
-            const [endYear, endMonth, endDay] = endDate.format('YYYY-MM-DD').split('-')
-            endDate = undefined
-            const dateMatcher = new RegExp(
-                `(${keyParams.prefix})(/year=(?<year>[0-9]{4}))?(/month=(?<month>[0-1][0-9]))?(/day=(?<day>[0-3][0-9]))?`
-            )
-            const dateParts = keyParams.curPrefix.match(dateMatcher)?.groups as MatchedDate
-            if (dateParts) {
-                if (dateParts.year && dateParts.month && dateParts.day) {
-                    if (
-                        (dateParts.year > startYear ||
-                            (dateParts.year === startYear && dateParts.month > startMonth) ||
-                            (dateParts.year === startYear &&
-                                dateParts.month === startMonth &&
-                                dateParts.day >= startDay)) &&
-                        (dateParts.year < endYear ||
-                            (dateParts.year === endYear && dateParts.month < endMonth) ||
-                            (dateParts.year === endYear && dateParts.month === endMonth && dateParts.day <= endDay))
-                    ) {
-                        inBounds = true
-                    } else {
-                        inBounds = false
-                    }
-                } else if (dateParts.year && dateParts.month) {
-                    if (
-                        (dateParts.year > startYear ||
-                            (dateParts.year === startYear && dateParts.month >= startMonth)) &&
-                        (dateParts.year < endYear || (dateParts.year === endYear && dateParts.month <= endMonth))
-                    ) {
-                        inBounds = true
-                    } else {
-                        inBounds = false
-                    }
-                } else if (dateParts.year) {
-                    if (dateParts.year >= startYear && dateParts.year <= endYear) {
-                        inBounds = true
-                    } else {
-                        inBounds = false
-                    }
+        if (!keyParams.curPrefix.endsWith(this._delimeter)) {
+            keyParams.curPrefix += this._delimeter
+        }
+
+        const listObjRequest: ListObjectsV2CommandInput = {
+            Bucket: keyParams.bucket,
+            Prefix: keyParams.curPrefix,
+            Delimiter: this._delimeter,
+        }
+        let continuationToken: undefined | string
+        do {
+            listObjRequest.ContinuationToken = continuationToken
+            let response: ListObjectsV2CommandOutput
+            try {
+                response = await this._s3Client.send(new ListObjectsV2Command(listObjRequest))
+            } catch (e) {
+                this.log(LogLevel.Error, `Failed to list objects at prefix ${keyParams.curPrefix}`)
+                throw e
+            }
+            if (response.CommonPrefixes && response.CommonPrefixes.length > 0) {
+                if (response.IsTruncated && response.NextContinuationToken) {
+                    continuationToken = response.NextContinuationToken
                 } else {
-                    // Having none of the date parts implies the prefix is
-                    // currently date agnositc and thus, it is in bounds.
-                    // Similar arguments can be made for the previous
-                    // else if statements - dctrotz 07/23/2020
-                    inBounds = true
+                    continuationToken = undefined
                 }
+                response.CommonPrefixes.forEach((commonPrefix) => {
+                    const prefixEval = this._evaluatePrefix(keyParams, commonPrefix, curPart)
+                    if (prefixEval.partition) {
+                        this._allPrefixes.push(prefixEval.partition)
+                    } else if (prefixEval.keyParams) {
+                        this._keyParams.push(prefixEval.keyParams)
+                    } else {
+                        throw new Error(`Unexpected partition info encountered. ${JSON.stringify(keyParams)}`)
+                    }
+                })
             } else {
-                throw new Error('Invalid prefix provided.')
+                throw new Error(`Unexpected empty response from S3. ${JSON.stringify(keyParams)}`)
             }
-        } else {
-            // No bounds provided means all prefxes are within the bounds
-            inBounds = true
-        }
-        return inBounds
+        } while (continuationToken)
+        this._scanPrefixForPartitionsProcessCount--
     }
 
     log(logLevel: LogLevel, logMessage: string) {
