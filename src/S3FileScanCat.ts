@@ -152,7 +152,7 @@ export class S3FileScanCat {
                     bucket,
                     prefix: srcPrefix,
                     curPrefix: `${srcPrefix.endsWith('/')?srcPrefix:srcPrefix+'/'}year=${currDate.format('YYYY')}/month=${currDate.format('MM')}/day=${currDate.format('DD')}` /* This changes as we traverse down the path, srcPrefix is where we start */,
-                    partitionStack: this._scannerOptions.partitionStack,
+                    partitionStack: this._scannerOptions.partitionStack.slice(3), // drop off the first three partitions since we are accounting from them here.
                     bounds: this._scannerOptions.bounds,
                 })
                 currDate.add(1, 'day')
