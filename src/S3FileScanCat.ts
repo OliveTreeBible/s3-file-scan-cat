@@ -244,7 +244,7 @@ export class S3FileScanCat {
                 }
                 contents = undefined
             } else {
-                throw new Error(`Unexpected Error: List S3 Objects request had missing response. Request: ${JSON.stringify(listObjRequest)}`)
+                this.log(LogLevel.Warn, `Prefix had no contents: ${prefix}`)
             }
             this._s3PrefixListObjectsProcessCount--
             this.log(LogLevel.Trace, `STATUS _concatFilesAtPrefix prefix=${prefix} - _s3PrefixListObjectsProcessCount: ${this._s3PrefixListObjectsProcessCount}`)
