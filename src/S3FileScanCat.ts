@@ -171,7 +171,7 @@ export class S3FileScanCat {
         while (this._keyParams.length > 0 || this._scanPrefixForPartitionsProcessCount > 0) {
             await waitUntil(
                 () => {
-                    if(this._scanPrefixForPartitionsProcessCount < this._scannerOptions.limits.scanPrefixForPartitionsProcessLimit) {
+                    if(this._keyParams.length > 0 && this._scanPrefixForPartitionsProcessCount < this._scannerOptions.limits.scanPrefixForPartitionsProcessLimit) {
                         return true
                     } else if(waits++ % 20 === 0) {
                         this.log(LogLevel.Debug, `Waiting on ListObjects to complete prefix=${srcPrefix} `)
