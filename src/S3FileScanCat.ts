@@ -2,7 +2,7 @@ import { WAIT_FOREVER, waitUntil } from 'async-wait-until'
 import * as moment from 'moment'
 import { Agent as HttpAgent } from 'node:http'
 import { Agent as HttpsAgent } from 'node:https'
-import { Logger, LogLevel } from 'typescript-logging'
+import { ISlackConfig, OTLoggerDeluxe } from 'ot-logger-deluxe'
 import * as zlib from 'zlib'
 
 import {
@@ -16,7 +16,6 @@ import { EmptyPrefixError } from './errors/EmptyPrefixError'
 import {
     AWSSecrets, ConcatState, PrefixEvalResult, PrefixParams, ScannerOptions
 } from './interfaces/scanner.interface'
-import { createLogger } from './utils/logger'
 
 const INFINITE_TIMEOUT = 2147483647 // This is actually 24 days but it is also the largest timeout allowed
 
@@ -26,7 +25,7 @@ type NullableMoment = undefined | moment.Moment
 type NullableString = undefined | string
 const MAX_LIST_KEYS = 1000
 export class S3FileScanCat {
-    private _log?: Logger
+    private _logger?: OTLoggerDeluxe
     private _delimeter: string
     private _keyParams: PrefixParams[]
     private _allPrefixes: string[]
@@ -44,13 +43,9 @@ export class S3FileScanCat {
     private _scannerOptions: ScannerOptions
     private _awsAccess: AWSSecrets
     private _s3Client: S3Client
-    constructor(useAccelerateEndpoint: boolean, scannerOptions: ScannerOptions, awsAccess: AWSSecrets) {
+    constructor(useAccelerateEndpoint: boolean, scannerOptions: ScannerOptions, awsAccess: AWSSecrets, slackConfig?: ISlackConfig | undefined) {
         if (scannerOptions.logOptions)
-            this._log = createLogger(
-                scannerOptions.logOptions.logGroupingPattern,
-                scannerOptions.logOptions.logLevel,
-                'app.s3-file-scan-cat'
-            )
+            this._logger = new OTLoggerDeluxe(scannerOptions.logOptions, 'file-scan-cat', slackConfig)
         this._delimeter = '/'
         this._keyParams = []
         this._allPrefixes = []
@@ -139,10 +134,7 @@ export class S3FileScanCat {
     }
 
     async scanAndProcessFiles(bucket: string, srcPrefix: string, destPrefix: string): Promise<void> {
-        this.log(
-            LogLevel.Trace,
-            `BEGIN scanConcatenateCopy srcPrefix=${srcPrefix}:destPrefix=${destPrefix}:partitionStack=${this._scannerOptions.partitionStack}`
-        )
+        this._logger?.logTrace(`BEGIN scanConcatenateCopy srcPrefix=${srcPrefix}:destPrefix=${destPrefix}:partitionStack=${this._scannerOptions.partitionStack}`)
         const destPath = destPrefix
         if(this._scannerOptions.bounds?.startDate && this._scannerOptions.bounds.endDate) {
             const currDate = moment(this._scannerOptions.bounds.startDate)
@@ -174,7 +166,7 @@ export class S3FileScanCat {
                     if (this._scanPrefixForPartitionsProcessCount === 0 || (this._keyParams.length > 0 && this._scanPrefixForPartitionsProcessCount < this._scannerOptions.limits.scanPrefixForPartitionsProcessLimit)) {
                         return true
                     } else if(waits++ % 20 === 0) {
-                        this.log(LogLevel.Debug, `Waiting on ListObjects to complete prefix=${srcPrefix} `)
+                        this._logger?.logDebug(`Waiting on ListObjects to complete prefix=${srcPrefix} `)
                     }
                 },
                 { timeout: WAIT_FOREVER }
@@ -197,12 +189,12 @@ export class S3FileScanCat {
 
         //  Wait until all processes are completed.
         await waitUntil(() => this._totalPrefixesToProcess === this._prefixesProcessedTotal, INFINITE_TIMEOUT)
-        this.log(LogLevel.Info, `Finished concatenating and compressing JSON S3 Objects for prefix=${srcPrefix}`)
+        this._logger?.logInfo(`Finished concatenating and compressing JSON S3 Objects for prefix=${srcPrefix}`)
         this._isDone = true
     }
 
     async concatFilesAtPrefix(bucket: string, prefix: string, srcPrefix: string, destPrefix: string): Promise<void> {
-        this.log(LogLevel.Trace, `BEGIN _concatFilesAtPrefix prefix=${prefix}`)
+        this._logger?.logTrace(`BEGIN _concatFilesAtPrefix prefix=${prefix}`)
         let waits = 0
         const concatState: ConcatState = {
             buffer: undefined,
@@ -224,10 +216,10 @@ export class S3FileScanCat {
             this._s3PrefixListObjectsProcessCount++
             let response: ListObjectsV2CommandOutput
             try {
-                this.log(LogLevel.Trace, `STATUS _concatFilesAtPrefix prefix=${prefix} - this._s3PrefixListObjectsProcessCount: ${this._s3PrefixListObjectsProcessCount}`)
+                this._logger?.logTrace(`STATUS _concatFilesAtPrefix prefix=${prefix} - this._s3PrefixListObjectsProcessCount: ${this._s3PrefixListObjectsProcessCount}`)
                 response = await this._s3Client.send(new ListObjectsV2Command(listObjRequest))
             } catch (e) {
-                this.log(LogLevel.Error, `Failed to list objects for ${listObjRequest.Prefix}, Error: ${e}`)
+                this._logger?.logError(`Failed to list objects for ${listObjRequest.Prefix}, Error: ${e}`)
                 throw e
             }
             if (response.Contents) {
@@ -244,7 +236,7 @@ export class S3FileScanCat {
                                 if(this._s3ObjectBodyProcessInProgress < this._s3ObjectBodyProcessInProgressLimit) {
                                     return true
                                 } else if(waits++ % 20 === 0) {
-                                    this.log(LogLevel.Trace, `Waiting on ListObjects to complete prefix=${srcPrefix} `)
+                                    this._logger?.logTrace(`Waiting on ListObjects to complete prefix=${srcPrefix} `)
                                 }
                             },
                             { timeout: WAIT_FOREVER }
@@ -252,17 +244,17 @@ export class S3FileScanCat {
                         // We purposely do not await on this - the awaitUntil above limits the number of these calls that are in progress at any given moment.
                         this._getAndProcessObjectBody(bucket, s3Object.Key, concatState, prefix, srcPrefix, destPrefix)
                     } else if (s3Object.Size === 0) {
-                        this.log(LogLevel.Warn, `S3 Object had zero size ${JSON.stringify(s3Object.Key)}`)
+                        this._logger?.logWarning(`S3 Object had zero size ${JSON.stringify(s3Object.Key)}`)
                     } else {
                         throw new Error('Invalid S3 Object encountered.')
                     }
                 }
                 contents = undefined
             } else {
-                this.log(LogLevel.Warn, `Prefix had no contents: ${prefix}`)
+                this._logger?.logWarning(`Prefix had no contents: ${prefix}`)
             }
             this._s3PrefixListObjectsProcessCount--
-            this.log(LogLevel.Trace, `STATUS _concatFilesAtPrefix prefix=${prefix} - _s3PrefixListObjectsProcessCount: ${this._s3PrefixListObjectsProcessCount}`)
+            this._logger?.logTrace(`STATUS _concatFilesAtPrefix prefix=${prefix} - _s3PrefixListObjectsProcessCount: ${this._s3PrefixListObjectsProcessCount}`)
         } while (concatState.continuationToken)
         // Finally wait until all the objects have been fetched and processed
         await waitUntil(
@@ -270,7 +262,7 @@ export class S3FileScanCat {
                 if(this._s3ObjectBodyProcessInProgress === 0) {
                     return true
                 } else if(waits++ % 20 === 0) {
-                    this.log(LogLevel.Trace, `Final wait for ListObjects to complete prefix=${srcPrefix} - _s3ObjectBodyProcessInProgress: ${this._s3ObjectBodyProcessInProgress}`)
+                    this._logger?.logTrace(`Final wait for ListObjects to complete prefix=${srcPrefix} - _s3ObjectBodyProcessInProgress: ${this._s3ObjectBodyProcessInProgress}`)
                 }
             },
             { timeout: WAIT_FOREVER }
@@ -287,13 +279,13 @@ export class S3FileScanCat {
             )
             concatState.buffer = undefined
         }
-        this.log(LogLevel.Trace, `END _concatFilesAtPrefix prefix=${prefix} - _s3PrefixListObjectsProcessCount: ${this._s3PrefixListObjectsProcessCount}`)
+        this._logger?.logTrace(`END _concatFilesAtPrefix prefix=${prefix} - _s3PrefixListObjectsProcessCount: ${this._s3PrefixListObjectsProcessCount}`)
         this._prefixesProcessedTotal++
     }
 
     async _getAndProcessObjectBody(bucket: string, s3Key: string, concatState: ConcatState, prefix: string, srcPrefix: string, destPrefix: string): Promise<void> {
         this._s3ObjectBodyProcessInProgress++
-        this.log(LogLevel.Trace, `BEGIN _getObjectBody objectKey=${s3Key} - _s3ObjectBodyProcessCount: ${this._s3ObjectBodyProcessInProgress}`)
+        this._logger?.logTrace(`BEGIN _getObjectBody objectKey=${s3Key} - _s3ObjectBodyProcessCount: ${this._s3ObjectBodyProcessInProgress}`)
         let response: undefined | GetObjectCommandOutput
         let retryCount = 0
         // With exponential backoff the last retry waits ~13 minutes.  This gives the system a chance to recover after a failure but also allows us to move on if we can resolve this in a reasonable amount of time
@@ -310,14 +302,14 @@ export class S3FileScanCat {
                 console.log(`[ERROR] S3 getObjectFailed: ${error}`)
                 lastError = error
                 if (retryCount < MAX_RETRIES) {
-                    this.log(LogLevel.Warn, `STATUS RETRY! _getAndProcessObjectBody s3Key=${s3Key} - _s3ObjectBodyProcessCount: ${this._s3ObjectBodyProcessInProgress} - retryCount: ${retryCount}`)
+                    this._logger?.logWarning(`STATUS RETRY! _getAndProcessObjectBody s3Key=${s3Key} - _s3ObjectBodyProcessCount: ${this._s3ObjectBodyProcessInProgress} - retryCount: ${retryCount}`)
                     await this._sleep(this._getWaitTimeForRetry(retryCount++))
                 } else {
                     break
                 }
             }
         }
-        this.log(LogLevel.Trace, `STATUS _getObjectBody s3Key=${s3Key} - _s3ObjectBodyProcessCount: ${this._s3ObjectBodyProcessInProgress}`)
+        this._logger?.logTrace(`STATUS _getObjectBody s3Key=${s3Key} - _s3ObjectBodyProcessCount: ${this._s3ObjectBodyProcessInProgress}`)
         if (response === undefined) {
             throw new Error(`[ERROR]: Unexpected S3 getObject error encountered ${s3Key}:${lastError ? lastError : ''}`)
         } else if (!response.Body) {
@@ -349,7 +341,7 @@ export class S3FileScanCat {
             }
         }
         this._s3ObjectBodyProcessInProgress--
-        this.log(LogLevel.Trace, `END _getObjectBody objectKey=${s3Key} - _s3ObjectBodyProcessCount: ${this._s3ObjectBodyProcessInProgress} - _s3ObjectsFetchedTotal: ${this._s3ObjectsFetchedTotal}`)
+        this._logger?.logTrace(`END _getObjectBody objectKey=${s3Key} - _s3ObjectBodyProcessCount: ${this._s3ObjectBodyProcessInProgress} - _s3ObjectsFetchedTotal: ${this._s3ObjectsFetchedTotal}`)
     }
 
     _sleep(milliseconds: number): Promise<void> {
@@ -372,14 +364,14 @@ export class S3FileScanCat {
         destPrefix: string,
         fileNumber: number
     ) {
-        this.log(LogLevel.Trace, `BEGIN _flushBuffer destination=${destPrefix}`)
+        this._logger?.logTrace(`BEGIN _flushBuffer destination=${destPrefix}`)
         const fileName = `${prefix.replace(srcPrefix, destPrefix)}/${fileNumber}.json.gz`
         await this._saveToS3(bucket, buffer, fileName)
-        this.log(LogLevel.Trace, `END _flushBuffer destination=${destPrefix}`)
+        this._logger?.logTrace(`END _flushBuffer destination=${destPrefix}`)
     }
 
     async _saveToS3(bucket: string, buffer: string, key: string): Promise<void> {
-        this.log(LogLevel.Trace, `BEGIN _saveToS3 key=${key} - _s3ObjectPutProcessCount: ${this._s3ObjectPutProcessCount}`)
+        this._logger?.logTrace(`BEGIN _saveToS3 key=${key} - _s3ObjectPutProcessCount: ${this._s3ObjectPutProcessCount}`)
 
         this._s3ObjectPutProcessCount++
 
@@ -394,17 +386,17 @@ export class S3FileScanCat {
         try {
             response = await this._s3Client.send(new PutObjectCommand(object))
         } catch (e) {
-            this.log(LogLevel.Error, `Failed to save object to S3: ${key}`)
+            this._logger?.logError(`Failed to save object to S3: ${key}`)
             throw e
         }
         this._s3ObjectPutProcessCount--
         this._s3ObjectsPutTotal++
-        this.log(LogLevel.Trace, `END _saveToS3 key=${key} - _s3ObjectPutProcessCount: ${this._s3ObjectPutProcessCount} - _s3ObjectsPutTotal: ${this._s3ObjectsPutTotal}`)
+        this._logger?.logTrace(`END _saveToS3 key=${key} - _s3ObjectPutProcessCount: ${this._s3ObjectPutProcessCount} - _s3ObjectsPutTotal: ${this._s3ObjectsPutTotal}`)
     }
 
     async _scanPrefixForPartitions(keyParams: PrefixParams): Promise<void> {
         this._scanPrefixForPartitionsProcessCount++
-        this.log(LogLevel.Trace, `_scanPrefixForPartitions ${keyParams.curPrefix}::${keyParams.partitionStack}`)
+        this._logger?.logTrace(`_scanPrefixForPartitions ${keyParams.curPrefix}::${keyParams.partitionStack}`)
         const curPart = keyParams.partitionStack.shift()
         if (!curPart) {
             throw new Error('Unexpected end of partition stack!')
@@ -426,7 +418,7 @@ export class S3FileScanCat {
             try {
                 response = await this._s3Client.send(new ListObjectsV2Command(listObjRequest))
             } catch (e) {
-                this.log(LogLevel.Error, `Failed to list objects at prefix ${keyParams.curPrefix}`)
+                this._logger?.logError(`Failed to list objects at prefix ${keyParams.curPrefix}`)
                 throw e
             }
             if (response.CommonPrefixes && response.CommonPrefixes.length > 0) {
@@ -452,33 +444,8 @@ export class S3FileScanCat {
         this._scanPrefixForPartitionsProcessCount--
     }
 
-    log(logLevel: LogLevel, logMessage: string) {
-        if (this._log) {
-            switch (logLevel) {
-                case LogLevel.Trace:
-                    this._log.trace(logMessage)
-                    break
-                case LogLevel.Debug:
-                    this._log.debug(logMessage)
-                    break
-                case LogLevel.Info:
-                    this._log.info(logMessage)
-                    break
-                case LogLevel.Warn:
-                    this._log.warn(logMessage)
-                    break
-                case LogLevel.Error:
-                    this._log.error(logMessage)
-                    break
-                case LogLevel.Fatal:
-                    this._log.fatal(logMessage)
-                    break
-            }
-        }
-    }
-
     _evaluatePrefix(keyParams: PrefixParams, commonPrefix: CommonPrefix, curPart: string): PrefixEvalResult {
-        this.log(LogLevel.Trace, `_keysForPrefix ${keyParams.curPrefix}`)
+        this._logger?.logTrace(`_keysForPrefix ${keyParams.curPrefix}`)
         const result: PrefixEvalResult = {}
         if (commonPrefix.Prefix) {
             const parts = commonPrefix.Prefix.split(this._delimeter)

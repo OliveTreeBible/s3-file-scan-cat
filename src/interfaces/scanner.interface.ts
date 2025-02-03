@@ -1,4 +1,4 @@
-import { LogLevel } from 'typescript-logging'
+import { OTLoggerDeluxeOptions } from 'ot-logger-deluxe'
 
 export interface ScannerConfig {
     aws: AWSConfig
@@ -11,15 +11,10 @@ export interface ScannerBounds {
 }
 
 export interface ScannerOptions {
-    logOptions?: LoggerOptions
+    logOptions?: OTLoggerDeluxeOptions
     partitionStack: string[]
     bounds?: ScannerBounds
     limits: ScannerLimits
-}
-
-export interface LoggerOptions {
-    logLevel: LogLevel
-    logGroupingPattern: string
 }
 
 export interface ScannerLimits {
