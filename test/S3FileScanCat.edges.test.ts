@@ -240,4 +240,120 @@ describe('S3FileScanCat edges (mocked S3)', () => {
             'Invalid S3 Object encountered.'
         )
     })
+
+    it('drains in-flight partition scans before rejecting so background work cannot mutate state', async () => {
+        let slowPartitionResolve: (() => void) | undefined
+        s3Mock.on(ListObjectsV2Command).callsFake((input) => {
+            if (input.Delimiter !== '/') {
+                return Promise.resolve({ Contents: [], IsTruncated: false })
+            }
+            if (input.Prefix === 'data/src/') {
+                return Promise.resolve({
+                    CommonPrefixes: [
+                        { Prefix: 'data/src/year=2020/' },
+                        { Prefix: 'data/src/year=2021/' },
+                    ],
+                    IsTruncated: false,
+                })
+            }
+            if (input.Prefix === 'data/src/year=2020/') {
+                return Promise.reject(new Error('boom-2020'))
+            }
+            if (input.Prefix === 'data/src/year=2021/') {
+                // Resolve only after the test releases us, so the fatal flag
+                // from the 2020 rejection has already fired.
+                return new Promise((resolve) => {
+                    slowPartitionResolve = () =>
+                        resolve({
+                            CommonPrefixes: [{ Prefix: 'data/src/year=2021/month=01/' }],
+                            IsTruncated: false,
+                        })
+                })
+            }
+            return Promise.resolve({ CommonPrefixes: [], IsTruncated: false })
+        })
+
+        const cat = new S3FileScanCat(
+            false,
+            scannerOptions({ partitionStack: ['year', 'month'] }),
+            testAwsSecrets
+        )
+
+        const scanPromise = cat.scanAndProcessFiles('bucket', 'data/src', 'data/dst')
+
+        // Give the root list + both child scans a chance to start, then release the slow one.
+        await new Promise((resolve) => setTimeout(resolve, 20))
+        expect(typeof slowPartitionResolve).toBe('function')
+        slowPartitionResolve?.()
+
+        await expect(scanPromise).rejects.toThrow('boom-2020')
+
+        // Cast past `private` so we can verify there is nothing still in flight.
+        const inFlight = (cat as unknown as { _inFlightPartitionScans: Set<Promise<void>> })
+            ._inFlightPartitionScans
+        expect(inFlight.size).toBe(0)
+
+        // The slow scan observed the fatal flag and must not have leaked a push.
+        const allPrefixes = (cat as unknown as { _allPrefixes: string[] })._allPrefixes
+        expect(allPrefixes).toEqual([])
+
+        // Give any stray microtasks/timers a chance to fire. State must stay stable.
+        const keyParamsBefore = [
+            ...(cat as unknown as { _keyParams: unknown[] })._keyParams,
+        ]
+        await new Promise((resolve) => setTimeout(resolve, 50))
+        expect((cat as unknown as { _allPrefixes: string[] })._allPrefixes).toEqual([])
+        expect((cat as unknown as { _keyParams: unknown[] })._keyParams).toEqual(keyParamsBefore)
+    })
+
+    it('drains in-flight body processors before rejecting on fatal body failure', async () => {
+        stubPartitionAndConcatList(() => ({
+            Contents: [
+                { Key: 'data/src/year=2020/fail.json', Size: 8 },
+                { Key: 'data/src/year=2020/slow.json', Size: 8 },
+            ],
+            IsTruncated: false,
+        }))
+
+        let slowGetResolve: (() => void) | undefined
+        s3Mock.on(GetObjectCommand).callsFake((input) => {
+            if (input.Key?.endsWith('fail.json')) {
+                return Promise.reject(new Error('permanent failure'))
+            }
+            return new Promise((resolve) => {
+                slowGetResolve = () =>
+                    resolve({
+                        Body: sdkStreamMixin(Readable.from(['{"slow":true}'])),
+                    })
+            })
+        })
+        s3Mock.on(PutObjectCommand).resolves({})
+
+        const cat = new S3FileScanCat(false, scannerOptions({ partitionStack: ['year'] }), testAwsSecrets)
+        // Avoid real 13-minute backoff on the failing key.
+        vi.spyOn(cat, '_sleep').mockResolvedValue(undefined)
+
+        const runPromise = cat.scanAndProcessFiles('bucket', 'data/src', 'data/dst')
+
+        // Let the concat list fire and both body processors start, then release the slow one
+        // after the failing one has exhausted its retries and set the fatal flag.
+        await new Promise((resolve) => setTimeout(resolve, 30))
+        expect(typeof slowGetResolve).toBe('function')
+        slowGetResolve?.()
+
+        await expect(runPromise).rejects.toThrow('permanent failure')
+
+        // The slow body must have observed the fatal flag and returned without appending
+        // to the buffer or triggering a put.
+        expect(cat.s3ObjectsPutTotal).toBe(0)
+        expect(s3Mock.commandCalls(PutObjectCommand).length).toBe(0)
+
+        // No background body workers should still be running at this point.
+        expect(cat.s3ObjectBodyProcessInProgress).toBe(0)
+
+        // State must stay stable even as event-loop ticks go by.
+        await new Promise((resolve) => setTimeout(resolve, 50))
+        expect(cat.s3ObjectsPutTotal).toBe(0)
+        expect(cat.s3ObjectBodyProcessInProgress).toBe(0)
+    })
 })

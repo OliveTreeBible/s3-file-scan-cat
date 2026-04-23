@@ -37,6 +37,12 @@ export class S3FileScanCat {
     private _isDone: boolean
     /** Set on first background failure so wait loops can exit and the scan rejects cleanly. */
     private _fatalScanError: Error | undefined
+    /**
+     * Tracks every in-flight `_scanPrefixForPartitions` promise so that when the scan aborts
+     * (fatal error or normal completion) we can await them all before returning. Without this
+     * the caller would see a rejection while background scans were still mutating shared state.
+     */
+    private _inFlightPartitionScans: Set<Promise<void>>
     private _s3ObjectBodyProcessInProgressLimit: number
     private _maxFileSizeBytes: number
     private _scannerOptions: ScannerOptions
@@ -62,6 +68,7 @@ export class S3FileScanCat {
         this._s3ObjectsPutTotal = 0
         this._isDone = false
         this._fatalScanError = undefined
+        this._inFlightPartitionScans = new Set()
         this._s3ObjectBodyProcessInProgressLimit =
             scannerOptions.limits?.s3ObjectBodyProcessInProgressLimit !== undefined
                 ? scannerOptions.limits?.s3ObjectBodyProcessInProgressLimit
@@ -195,34 +202,52 @@ export class S3FileScanCat {
         }
 
         let waits = 0
-        while (this._keyParams.length > 0 || this._scanPrefixForPartitionsProcessCount > 0) {
-            await waitUntil(() => {
-                if (this._fatalScanError) {
-                    return true
-                }
-                if (
-                    this._scanPrefixForPartitionsProcessCount === 0 ||
-                    (this._keyParams.length > 0 &&
-                        this._scanPrefixForPartitionsProcessCount <
-                            this._scannerOptions.limits.scanPrefixForPartitionsProcessLimit)
-                ) {
-                    return true
-                } else if (waits++ % 20 === 0) {
-                    void this._logger?.debug(`Waiting on ListObjects to complete prefix=${srcPrefix} `)
-                }
-            })
-            if (this._fatalScanError) {
-                throw this._fatalScanError
-            }
-            const keyParam = this._keyParams.shift()
-            if (keyParam) {
-                void this._scanPrefixForPartitions(keyParam).catch((err: unknown) => {
-                    void this._logger?.error(
-                        `Partition scan failed for prefix=${keyParam.curPrefix}: ${err instanceof Error ? err.message : String(err)}`
-                    )
-                    this._setFatalScanError(err)
+        try {
+            while (this._keyParams.length > 0 || this._scanPrefixForPartitionsProcessCount > 0) {
+                await waitUntil(() => {
+                    if (this._fatalScanError) {
+                        return true
+                    }
+                    if (
+                        this._scanPrefixForPartitionsProcessCount === 0 ||
+                        (this._keyParams.length > 0 &&
+                            this._scanPrefixForPartitionsProcessCount <
+                                this._scannerOptions.limits.scanPrefixForPartitionsProcessLimit)
+                    ) {
+                        return true
+                    } else if (waits++ % 20 === 0) {
+                        void this._logger?.debug(`Waiting on ListObjects to complete prefix=${srcPrefix} `)
+                    }
                 })
+                if (this._fatalScanError) {
+                    break
+                }
+                const keyParam = this._keyParams.shift()
+                if (keyParam) {
+                    // Track the promise so a fatal error can't leave background scans
+                    // mutating shared state after scanAndProcessFiles has returned.
+                    const scanPromise: Promise<void> = this._scanPrefixForPartitions(keyParam)
+                        .catch((err: unknown) => {
+                            void this._logger?.error(
+                                `Partition scan failed for prefix=${keyParam.curPrefix}: ${err instanceof Error ? err.message : String(err)}`
+                            )
+                            this._setFatalScanError(err)
+                        })
+                        .finally(() => {
+                            this._inFlightPartitionScans.delete(scanPromise)
+                        })
+                    this._inFlightPartitionScans.add(scanPromise)
+                }
             }
+        } finally {
+            // Always drain in-flight partition scans before proceeding (or rethrowing).
+            // Promise.allSettled never rejects, so this is safe in a finally block.
+            if (this._inFlightPartitionScans.size > 0) {
+                await Promise.allSettled([...this._inFlightPartitionScans])
+            }
+        }
+        if (this._fatalScanError) {
+            throw this._fatalScanError
         }
         this._prefixesProcessedTotal = 0
         this._totalPrefixesToProcess = this._allPrefixes.length
@@ -257,94 +282,106 @@ export class S3FileScanCat {
             _bufferMutex: Promise.resolve(),
         }
 
+        // Track every spawned body-processor so we can guarantee they have all
+        // settled before this method returns. Without this, a fatal error would
+        // leave workers mutating `concatState` / counters after we've thrown.
+        const inFlightBodies = new Set<Promise<void>>()
+
         const listObjRequest: ListObjectsV2CommandInput = {
             Bucket: bucket,
             Prefix: prefix.endsWith('/') ? prefix : `${prefix}/`,
             MaxKeys: MAX_LIST_KEYS,
         }
-        do {
-            if (concatState.continuationToken) {
-                listObjRequest.ContinuationToken = concatState.continuationToken
-            } else {
-                listObjRequest.ContinuationToken = undefined
-            }
-            this._s3PrefixListObjectsProcessCount++
-            let response: ListObjectsV2CommandOutput
-            try {
-                void this._logger?.trace(
-                    `STATUS _concatFilesAtPrefix prefix=${prefix} - this._s3PrefixListObjectsProcessCount: ${this._s3PrefixListObjectsProcessCount}`
-                )
-                response = await this._s3Client.send(new ListObjectsV2Command(listObjRequest))
-            } catch (e) {
-                void this._logger?.error(`Failed to list objects for ${listObjRequest.Prefix}, Error: ${e}`)
-                throw e
-            }
-            if (response.Contents) {
-                if (response.IsTruncated === true && response.NextContinuationToken !== undefined) {
-                    concatState.continuationToken = response.NextContinuationToken
+        try {
+            do {
+                if (this._fatalScanError) {
+                    break
+                }
+                if (concatState.continuationToken) {
+                    listObjRequest.ContinuationToken = concatState.continuationToken
                 } else {
-                    concatState.continuationToken = undefined
+                    listObjRequest.ContinuationToken = undefined
                 }
-                for (const s3Object of response.Contents) {
-                    if (s3Object.Size && s3Object.Key) {
-                        await waitUntil(() => {
-                            if (this._fatalScanError) {
-                                return true
-                            }
-                            if (this._s3ObjectBodyProcessInProgress < this._s3ObjectBodyProcessInProgressLimit) {
-                                return true
-                            } else if (waits++ % 20 === 0) {
-                                void this._logger?.trace(`Waiting on ListObjects to complete prefix=${srcPrefix} `)
-                            }
-                        })
-                        if (this._fatalScanError) {
-                            throw this._fatalScanError
-                        }
-                        // We purposely do not await on this - the waitUntil above limits the number of these calls that are in progress at any given moment.
-                        void this._getAndProcessObjectBody(
-                            bucket,
-                            s3Object.Key,
-                            concatState,
-                            prefix,
-                            srcPrefix,
-                            destPrefix
-                        ).catch((err: unknown) => {
-                            void this._logger?.error(
-                                `getObject/process failed for key=${s3Object.Key}: ${err instanceof Error ? err.message : String(err)}`
-                            )
-                            this._setFatalScanError(err)
-                        })
-                    } else if (s3Object.Size === 0) {
-                        void this._logger?.warn(`S3 Object had zero size ${JSON.stringify(s3Object.Key)}`)
+                this._s3PrefixListObjectsProcessCount++
+                let response: ListObjectsV2CommandOutput
+                try {
+                    void this._logger?.trace(
+                        `STATUS _concatFilesAtPrefix prefix=${prefix} - this._s3PrefixListObjectsProcessCount: ${this._s3PrefixListObjectsProcessCount}`
+                    )
+                    response = await this._s3Client.send(new ListObjectsV2Command(listObjRequest))
+                } catch (e) {
+                    void this._logger?.error(`Failed to list objects for ${listObjRequest.Prefix}, Error: ${e}`)
+                    throw e
+                }
+                if (response.Contents) {
+                    if (response.IsTruncated === true && response.NextContinuationToken !== undefined) {
+                        concatState.continuationToken = response.NextContinuationToken
                     } else {
-                        throw new Error('Invalid S3 Object encountered.')
+                        concatState.continuationToken = undefined
                     }
+                    for (const s3Object of response.Contents) {
+                        if (s3Object.Size && s3Object.Key) {
+                            await waitUntil(() => {
+                                if (this._fatalScanError) {
+                                    return true
+                                }
+                                if (this._s3ObjectBodyProcessInProgress < this._s3ObjectBodyProcessInProgressLimit) {
+                                    return true
+                                } else if (waits++ % 20 === 0) {
+                                    void this._logger?.trace(`Waiting on ListObjects to complete prefix=${srcPrefix} `)
+                                }
+                            })
+                            if (this._fatalScanError) {
+                                break
+                            }
+                            // We purposely do not await on this - the waitUntil above limits the number of these
+                            // calls that are in progress at any given moment. The promise is tracked in
+                            // `inFlightBodies` so the finally block can await it before returning.
+                            const bodyPromise: Promise<void> = this._getAndProcessObjectBody(
+                                bucket,
+                                s3Object.Key,
+                                concatState,
+                                prefix,
+                                srcPrefix,
+                                destPrefix
+                            )
+                                .catch((err: unknown) => {
+                                    void this._logger?.error(
+                                        `getObject/process failed for key=${s3Object.Key}: ${err instanceof Error ? err.message : String(err)}`
+                                    )
+                                    this._setFatalScanError(err)
+                                })
+                                .finally(() => {
+                                    inFlightBodies.delete(bodyPromise)
+                                })
+                            inFlightBodies.add(bodyPromise)
+                        } else if (s3Object.Size === 0) {
+                            void this._logger?.warn(`S3 Object had zero size ${JSON.stringify(s3Object.Key)}`)
+                        } else {
+                            throw new Error('Invalid S3 Object encountered.')
+                        }
+                    }
+                } else {
+                    void this._logger?.warn(`Prefix had no contents: ${prefix}`)
                 }
-            } else {
-                void this._logger?.warn(`Prefix had no contents: ${prefix}`)
-            }
-            this._s3PrefixListObjectsProcessCount--
-            void this._logger?.trace(
-                `STATUS _concatFilesAtPrefix prefix=${prefix} - _s3PrefixListObjectsProcessCount: ${this._s3PrefixListObjectsProcessCount}`
-            )
-        } while (concatState.continuationToken)
-        // Finally wait until all the objects have been fetched and processed
-        await waitUntil(() => {
-            if (this._fatalScanError) {
-                return true
-            }
-            if (this._s3ObjectBodyProcessInProgress === 0) {
-                return true
-            } else if (waits++ % 20 === 0) {
+                this._s3PrefixListObjectsProcessCount--
                 void this._logger?.trace(
-                    `Final wait for ListObjects to complete prefix=${srcPrefix} - _s3ObjectBodyProcessInProgress: ${this._s3ObjectBodyProcessInProgress}`
+                    `STATUS _concatFilesAtPrefix prefix=${prefix} - _s3PrefixListObjectsProcessCount: ${this._s3PrefixListObjectsProcessCount}`
                 )
+            } while (concatState.continuationToken && !this._fatalScanError)
+        } finally {
+            // Always drain in-flight body processors before returning so they cannot
+            // mutate `concatState` or the shared counters after this method resolves.
+            if (inFlightBodies.size > 0) {
+                await Promise.allSettled([...inFlightBodies])
             }
-        })
+        }
         if (this._fatalScanError) {
             throw this._fatalScanError
         }
-        // Now do a final flush (under the same mutex as in-flight appends)
+        // Now do a final flush (under the same mutex as in-flight appends).
+        // `inFlightBodies` has been drained above, so this mutex acquisition is
+        // only defensive against a future refactor that reintroduces concurrency.
         const unlockFinal = await this._acquireConcatBufferLock(concatState)
         try {
             if (!concatState.continuationToken && concatState.buffer && concatState.buffer.length > 0) {
@@ -380,12 +417,21 @@ export class S3FileScanCat {
             `BEGIN _getObjectBody objectKey=${s3Key} - _s3ObjectBodyProcessCount: ${this._s3ObjectBodyProcessInProgress}`
         )
         try {
+            // If a sibling worker already failed, abandon this one before issuing S3 calls
+            // or mutating `concatState`. concatFilesAtPrefix awaits all spawned bodies in its
+            // finally block, so this early return is safe.
+            if (this._fatalScanError) {
+                return
+            }
             let response: undefined | GetObjectCommandOutput
             let retryCount = 0
             // With exponential backoff the last retry waits ~13 minutes.  This gives the system a chance to recover after a failure but also allows us to move on if we can resolve this in a reasonable amount of time
             const MAX_RETRIES = 14
             let lastError: unknown
             while (!response) {
+                if (this._fatalScanError) {
+                    return
+                }
                 try {
                     response = await this._s3Client.send(
                         new GetObjectCommand({
@@ -406,6 +452,9 @@ export class S3FileScanCat {
                         break
                     }
                 }
+            }
+            if (this._fatalScanError) {
+                return
             }
             void this._logger?.trace(
                 `STATUS _getObjectBody s3Key=${s3Key} - _s3ObjectBodyProcessCount: ${this._s3ObjectBodyProcessInProgress}`
@@ -530,6 +579,11 @@ export class S3FileScanCat {
     async _scanPrefixForPartitions(keyParams: PrefixParams): Promise<void> {
         this._scanPrefixForPartitionsProcessCount++
         try {
+            // If a sibling scan has already failed, abandon this one without touching
+            // shared state or issuing additional S3 calls.
+            if (this._fatalScanError) {
+                return
+            }
             void this._logger?.trace(`_scanPrefixForPartitions ${keyParams.curPrefix}::${keyParams.partitionStack}`)
             const curPart = keyParams.partitionStack.shift()
             if (!curPart) {
@@ -547,6 +601,9 @@ export class S3FileScanCat {
             }
             let continuationToken: undefined | string
             do {
+                if (this._fatalScanError) {
+                    return
+                }
                 listObjRequest.ContinuationToken = continuationToken
                 let response: ListObjectsV2CommandOutput
                 try {
@@ -554,6 +611,9 @@ export class S3FileScanCat {
                 } catch (e) {
                     void this._logger?.error(`Failed to list objects at prefix ${keyParams.curPrefix}`)
                     throw e
+                }
+                if (this._fatalScanError) {
+                    return
                 }
                 if (response.CommonPrefixes && response.CommonPrefixes.length > 0) {
                     if (response.IsTruncated && response.NextContinuationToken) {
