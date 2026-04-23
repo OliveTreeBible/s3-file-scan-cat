@@ -525,15 +525,30 @@ export class S3FileScanCat {
             try {
                 concatState.pendingBodies.set(seq, objectBodyStr)
                 while (concatState.pendingBodies.has(concatState.nextSeqToAppend)) {
-                    const bodyStr = concatState.pendingBodies.get(concatState.nextSeqToAppend) as string
+                    const rawBody = concatState.pendingBodies.get(concatState.nextSeqToAppend) as string
                     concatState.pendingBodies.delete(concatState.nextSeqToAppend)
                     concatState.nextSeqToAppend++
-                    if (bodyStr.length === 0) {
+                    if (rawBody.length === 0) {
                         continue
+                    }
+                    // Normalize each source body to end with exactly one '\n' so that:
+                    //   - the last record of every output part is terminated (cross-part
+                    //     concatenation yields valid NDJSON);
+                    //   - there is always exactly one newline between adjacent bodies,
+                    //     independent of whether the source happened to end with one.
+                    const bodyWithNl = rawBody.endsWith('\n') ? rawBody : `${rawBody}\n`
+                    // Use the normalized length for the size check so the cap is honored
+                    // including the separator/terminator (previously ignored, allowing
+                    // overflow of up to N-1 bytes).
+                    const addSize = bodyWithNl.length
+                    if (addSize > this._maxFileSizeBytes) {
+                        void this._logger?.warn(
+                            `Source object body (${rawBody.length} bytes, key=${s3Key}) exceeds maxFileSizeBytes (${this._maxFileSizeBytes}); emitting as a single oversized output part.`
+                        )
                     }
                     if (
                         concatState.buffer &&
-                        concatState.buffer.length + bodyStr.length > this._maxFileSizeBytes
+                        concatState.buffer.length + addSize > this._maxFileSizeBytes
                     ) {
                         await this._flushBuffer(
                             bucket,
@@ -545,11 +560,7 @@ export class S3FileScanCat {
                         )
                         concatState.buffer = undefined
                     }
-                    if (concatState.buffer) {
-                        concatState.buffer += '\n' + bodyStr
-                    } else {
-                        concatState.buffer = bodyStr
-                    }
+                    concatState.buffer = (concatState.buffer ?? '') + bodyWithNl
                 }
             } finally {
                 unlockBuf()

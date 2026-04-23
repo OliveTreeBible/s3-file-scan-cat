@@ -59,6 +59,8 @@ describe('S3FileScanCat.concat (mocked S3)', () => {
         const body = putInput.Body
         expect(body).toBeInstanceOf(Uint8Array)
         const plain = gunzipSync(body as Uint8Array).toString('utf8')
-        expect(plain).toBe('{"x":1}\n{"y":2}')
+        // Each source body is normalized to end with '\n', so the concatenated output ends with
+        // a trailing newline. This makes gzipped parts safely concatenable as NDJSON streams.
+        expect(plain).toBe('{"x":1}\n{"y":2}\n')
     })
 })

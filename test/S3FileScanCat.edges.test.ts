@@ -112,7 +112,7 @@ describe('S3FileScanCat edges (mocked S3)', () => {
         expect(cat.s3ObjectsPutTotal).toBe(1)
         const put = s3Mock.commandCalls(PutObjectCommand)[0].args[0].input
         expect(put.Key).toBe('data/dst/year=2020/0.json.gz')
-        expect(gunzipSync(put.Body as Uint8Array).toString('utf8')).toBe('{"late":true}')
+        expect(gunzipSync(put.Body as Uint8Array).toString('utf8')).toBe('{"late":true}\n')
     })
 
     it('flushes multiple gzip parts when maxFileSizeBytes is exceeded', async () => {
@@ -151,7 +151,7 @@ describe('S3FileScanCat edges (mocked S3)', () => {
             .commandCalls(PutObjectCommand)
             .map((c) => gunzipSync(c.args[0].input.Body as Uint8Array).toString('utf8'))
             .sort()
-        expect(bodies).toEqual(['{"a":1}', '{"b":2}'])
+        expect(bodies).toEqual(['{"a":1}\n', '{"b":2}\n'])
     })
 
     it('retries GetObject with backoff until success', async () => {
@@ -490,6 +490,107 @@ describe('S3FileScanCat edges (mocked S3)', () => {
         expect(cat.s3ObjectsPutTotal).toBe(1)
     })
 
+    it('does not emit double newlines when source bodies already end with a newline', async () => {
+        stubPartitionAndConcatList(() => ({
+            Contents: [
+                { Key: 'data/src/year=2020/a.json', Size: 8 },
+                { Key: 'data/src/year=2020/b.json', Size: 8 },
+            ],
+            IsTruncated: false,
+        }))
+        // Both source bodies already end with '\n'. The join must not add a second newline
+        // between them (which would produce an empty NDJSON record).
+        s3Mock.on(GetObjectCommand).callsFake((input) => {
+            const payload = input.Key?.endsWith('a.json') ? '{"a":1}\n' : '{"b":2}\n'
+            return Promise.resolve({ Body: sdkStreamMixin(Readable.from([payload])) })
+        })
+        s3Mock.on(PutObjectCommand).resolves({})
+
+        const cat = new S3FileScanCat(false, scannerOptions({ partitionStack: ['year'] }), testAwsSecrets)
+        await cat.scanAndProcessFiles('bucket', 'data/src', 'data/dst')
+
+        const put = s3Mock.commandCalls(PutObjectCommand)[0].args[0].input
+        const plain = gunzipSync(put.Body as Uint8Array).toString('utf8')
+        expect(plain).toBe('{"a":1}\n{"b":2}\n')
+    })
+
+    it('warns and still emits the part when a single source body exceeds maxFileSizeBytes', async () => {
+        const bigBody = 'x'.repeat(128)
+        stubPartitionAndConcatList(() => ({
+            Contents: [{ Key: 'data/src/year=2020/big.json', Size: bigBody.length }],
+            IsTruncated: false,
+        }))
+        s3Mock.on(GetObjectCommand).callsFake(() =>
+            Promise.resolve({ Body: sdkStreamMixin(Readable.from([bigBody])) })
+        )
+        s3Mock.on(PutObjectCommand).resolves({})
+
+        const warnSpy = vi.fn()
+        const cat = new S3FileScanCat(
+            false,
+            scannerOptions({
+                partitionStack: ['year'],
+                limits: { maxFileSizeBytes: 16 },
+                loggerOptions: { level: 'warn' },
+            }),
+            testAwsSecrets
+        )
+        // The warn channel goes through ot-logger-deluxe; stub the created logger's warn.
+        const logger = (cat as unknown as { _logger?: { warn: (...args: unknown[]) => unknown } })._logger
+        if (logger) {
+            logger.warn = warnSpy
+        }
+
+        await cat.scanAndProcessFiles('bucket', 'data/src', 'data/dst')
+
+        const putCalls = s3Mock.commandCalls(PutObjectCommand)
+        expect(putCalls.length).toBe(1)
+        const plain = gunzipSync(putCalls[0].args[0].input.Body as Uint8Array).toString('utf8')
+        expect(plain).toBe(`${bigBody}\n`)
+        // The oversized warning should have fired.
+        expect(
+            warnSpy.mock.calls.some((args) =>
+                String(args[0]).includes('exceeds maxFileSizeBytes')
+            )
+        ).toBe(true)
+    })
+
+    it('flushes before adding a body that would push the buffer over maxFileSizeBytes (including the newline)', async () => {
+        // Two 10-byte bodies with a 20-byte cap. Without counting the added newline, the code
+        // would decide 10+10 == 20 fits and emit a single 21-byte (incl. separator) part. With
+        // the fix the cap is honored: the second body triggers a flush first.
+        stubPartitionAndConcatList(() => ({
+            Contents: [
+                { Key: 'data/src/year=2020/a.json', Size: 10 },
+                { Key: 'data/src/year=2020/b.json', Size: 10 },
+            ],
+            IsTruncated: false,
+        }))
+        s3Mock.on(GetObjectCommand).callsFake((input) => {
+            const payload = input.Key?.endsWith('a.json') ? 'AAAAAAAAAA' : 'BBBBBBBBBB'
+            return Promise.resolve({ Body: sdkStreamMixin(Readable.from([payload])) })
+        })
+        s3Mock.on(PutObjectCommand).resolves({})
+
+        const cat = new S3FileScanCat(
+            false,
+            scannerOptions({
+                partitionStack: ['year'],
+                limits: { maxFileSizeBytes: 20 },
+            }),
+            testAwsSecrets
+        )
+        await cat.scanAndProcessFiles('bucket', 'data/src', 'data/dst')
+
+        const puts = s3Mock.commandCalls(PutObjectCommand)
+        expect(puts.length).toBe(2)
+        // Each output part is one body + terminating newline (11 bytes) - well under the cap.
+        const bodies = puts
+            .map((c) => gunzipSync(c.args[0].input.Body as Uint8Array).toString('utf8'))
+            .sort()
+        expect(bodies).toEqual(['AAAAAAAAAA\n', 'BBBBBBBBBB\n'])
+    })
+
     it('concatenates bodies in S3 listing order even when GetObject completes out of order', async () => {
         stubPartitionAndConcatList(() => ({
             // S3 returns keys in lexicographic order. Our output must follow this order.
@@ -541,7 +642,7 @@ describe('S3FileScanCat edges (mocked S3)', () => {
         const put = s3Mock.commandCalls(PutObjectCommand)[0].args[0].input
         expect(put.Key).toBe('data/dst/year=2020/0.json.gz')
         const plain = gunzipSync(put.Body as Uint8Array).toString('utf8')
-        expect(plain).toBe('{"a":1}\n{"b":2}\n{"c":3}')
+        expect(plain).toBe('{"a":1}\n{"b":2}\n{"c":3}\n')
     })
 
     it('does not leak _s3PrefixListObjectsProcessCount when concat ListObjectsV2 throws', async () => {
