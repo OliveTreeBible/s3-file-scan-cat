@@ -22,7 +22,6 @@ import {
 import { formatUtcYmdParts, utcDayStartMs } from './utcDayRange'
 import { waitUntil } from './waitUntil'
 
-const INFINITE_TIMEOUT = 2147483647 // Largest practical timeout (matches prior behavior)
 const MS_PER_DAY = 24 * 60 * 60 * 1000
 const MAX_LIST_KEYS = 1000
 
@@ -276,11 +275,12 @@ export class S3FileScanCat {
             throw new EmptyPrefixError()
         }
 
-        //  Wait until all processes are completed.
-        await waitUntil(
-            () => this._totalPrefixesToProcess === this._prefixesProcessedTotal,
-            INFINITE_TIMEOUT
-        )
+        // The sequential `await this.concatFilesAtPrefix(...)` loop above guarantees every
+        // prefix has already incremented `_prefixesProcessedTotal` before we arrive here, so
+        // there is nothing left to wait for. A previous `waitUntil(... === ...)` at this
+        // spot was dead code *and* ignored `_fatalScanError`, which would have been a real
+        // hazard if the loop was ever parallelized. Removing it rather than "fixing" it
+        // because the explicit sequential await is already the correct invariant.
         void this._logger?.info(`Finished concatenating and compressing JSON S3 Objects for prefix=${srcPrefix}`)
         await this._logger?.flush()
         this._isDone = true
