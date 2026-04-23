@@ -23,7 +23,7 @@ const MAX_LIST_KEYS = 1000
 
 export class S3FileScanCat {
     private _logger?: Logger
-    private _delimeter: string
+    private _delimiter: string
     private _keyParams: PrefixParams[]
     private _allPrefixes: string[]
     private _scanPrefixForPartitionsProcessCount: number
@@ -49,7 +49,7 @@ export class S3FileScanCat {
                 name: 'file-scan-cat',
             })
         }
-        this._delimeter = '/'
+        this._delimiter = '/'
         this._keyParams = []
         this._allPrefixes = []
         this._scanPrefixForPartitionsProcessCount = 0
@@ -514,14 +514,14 @@ export class S3FileScanCat {
                 throw new Error('Unexpected end of partition stack!')
             }
 
-            if (!keyParams.curPrefix.endsWith(this._delimeter)) {
-                keyParams.curPrefix += this._delimeter
+            if (!keyParams.curPrefix.endsWith(this._delimiter)) {
+                keyParams.curPrefix += this._delimiter
             }
 
             const listObjRequest: ListObjectsV2CommandInput = {
                 Bucket: keyParams.bucket,
                 Prefix: keyParams.curPrefix,
-                Delimiter: this._delimeter,
+                Delimiter: this._delimiter,
             }
             let continuationToken: undefined | string
             do {
@@ -562,7 +562,7 @@ export class S3FileScanCat {
         void this._logger?.trace(`_keysForPrefix ${keyParams.curPrefix}`)
         const result: PrefixEvalResult = {}
         if (commonPrefix.Prefix) {
-            const parts = commonPrefix.Prefix.split(this._delimeter)
+            const parts = commonPrefix.Prefix.split(this._delimiter)
             if (parts.length > 1) {
                 const lastPart = parts[parts.length - 2]
                 if (lastPart.startsWith(curPart)) {
