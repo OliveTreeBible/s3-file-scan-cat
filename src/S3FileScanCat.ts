@@ -335,7 +335,7 @@ export class S3FileScanCat {
                 )
                 lastError = undefined
             } catch (error) {
-                console.log(`[ERROR] S3 getObjectFailed: ${error}`)
+                void this._logger?.error(`[ERROR] S3 getObjectFailed: ${error}`)
                 lastError = error
                 if (retryCount < MAX_RETRIES) {
                     void this._logger?.warn(
