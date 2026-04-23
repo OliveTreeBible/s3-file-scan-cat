@@ -49,6 +49,8 @@ export interface ConcatState {
     continuationToken: undefined | string
     buffer: undefined | string
     fileNumber: number
+    /** Tail of a promise chain; serializes buffer append/flush for concurrent object workers. */
+    _bufferMutex?: Promise<void>
 }
 
 export interface PrefixEvalResult {

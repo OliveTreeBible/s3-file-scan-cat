@@ -18,7 +18,7 @@ import { formatUtcYmdParts, utcDayStartMs } from './utcDayRange'
 import { waitUntil } from './waitUntil'
 
 const INFINITE_TIMEOUT = 2147483647 // Largest practical timeout (matches prior behavior)
-
+const MS_PER_DAY = 24 * 60 * 60 * 1000
 const MAX_LIST_KEYS = 1000
 
 export class S3FileScanCat {
@@ -152,7 +152,7 @@ export class S3FileScanCat {
         if (this._scannerOptions.bounds?.startDate && this._scannerOptions.bounds.endDate) {
             const startMs = utcDayStartMs(this._scannerOptions.bounds.startDate)
             const endMs = utcDayStartMs(this._scannerOptions.bounds.endDate)
-            for (let t = startMs; t <= endMs; t += 86_400_000) {
+            for (let t = startMs; t <= endMs; t += MS_PER_DAY) {
                 const { year, month, day } = formatUtcYmdParts(t)
                 this._keyParams.push({
                     bucket,
@@ -232,6 +232,7 @@ export class S3FileScanCat {
             buffer: undefined,
             continuationToken: undefined,
             fileNumber: 0,
+            _bufferMutex: Promise.resolve(),
         }
 
         const listObjRequest: ListObjectsV2CommandInput = {
@@ -321,17 +322,22 @@ export class S3FileScanCat {
         if (this._fatalScanError) {
             throw this._fatalScanError
         }
-        // Now do a final flush
-        if (!concatState.continuationToken && concatState.buffer && concatState.buffer.length > 0) {
-            this._flushBuffer(
-                bucket,
-                concatState.buffer,
-                prefix,
-                srcPrefix,
-                destPrefix,
-                concatState.fileNumber++
-            )
-            concatState.buffer = undefined
+        // Now do a final flush (under the same mutex as in-flight appends)
+        const unlockFinal = await this._acquireConcatBufferLock(concatState)
+        try {
+            if (!concatState.continuationToken && concatState.buffer && concatState.buffer.length > 0) {
+                await this._flushBuffer(
+                    bucket,
+                    concatState.buffer,
+                    prefix,
+                    srcPrefix,
+                    destPrefix,
+                    concatState.fileNumber++
+                )
+                concatState.buffer = undefined
+            }
+        } finally {
+            unlockFinal()
         }
         void this._logger?.trace(
             `END _concatFilesAtPrefix prefix=${prefix} - _s3PrefixListObjectsProcessCount: ${this._s3PrefixListObjectsProcessCount}`
@@ -393,24 +399,29 @@ export class S3FileScanCat {
             this._s3ObjectsFetchedTotal++
 
             if (objectBodyStr.length > 0) {
-                if (
-                    concatState.buffer &&
-                    concatState.buffer.length + objectBodyStr.length > this._maxFileSizeBytes
-                ) {
-                    this._flushBuffer(
-                        bucket,
-                        concatState.buffer,
-                        prefix,
-                        srcPrefix,
-                        destPrefix,
-                        concatState.fileNumber++
-                    )
-                    concatState.buffer = undefined
-                }
-                if (concatState.buffer) {
-                    concatState.buffer += '\n' + objectBodyStr
-                } else {
-                    concatState.buffer = objectBodyStr
+                const unlockBuf = await this._acquireConcatBufferLock(concatState)
+                try {
+                    if (
+                        concatState.buffer &&
+                        concatState.buffer.length + objectBodyStr.length > this._maxFileSizeBytes
+                    ) {
+                        await this._flushBuffer(
+                            bucket,
+                            concatState.buffer,
+                            prefix,
+                            srcPrefix,
+                            destPrefix,
+                            concatState.fileNumber++
+                        )
+                        concatState.buffer = undefined
+                    }
+                    if (concatState.buffer) {
+                        concatState.buffer += '\n' + objectBodyStr
+                    } else {
+                        concatState.buffer = objectBodyStr
+                    }
+                } finally {
+                    unlockBuf()
                 }
             }
         } finally {
@@ -426,6 +437,22 @@ export class S3FileScanCat {
             return
         }
         this._fatalScanError = err instanceof Error ? err : new Error(String(err))
+    }
+
+    /** Serialize buffer reads/writes/flushes across concurrent `_getAndProcessObjectBody` calls. */
+    private async _acquireConcatBufferLock(concatState: ConcatState): Promise<() => void> {
+        if (concatState._bufferMutex === undefined) {
+            concatState._bufferMutex = Promise.resolve()
+        }
+        const previous = concatState._bufferMutex
+        let resolveUnlock!: () => void
+        concatState._bufferMutex = new Promise<void>((resolve) => {
+            resolveUnlock = resolve
+        })
+        await previous
+        return () => {
+            resolveUnlock()
+        }
     }
 
     _sleep(milliseconds: number): Promise<void> {
@@ -447,7 +474,7 @@ export class S3FileScanCat {
         srcPrefix: string,
         destPrefix: string,
         fileNumber: number
-    ) {
+    ): Promise<void> {
         void this._logger?.trace(`BEGIN _flushBuffer destination=${destPrefix}`)
         const fileName = `${prefix.replace(srcPrefix, destPrefix)}/${fileNumber}.json.gz`
         await this._saveToS3(bucket, buffer, fileName)
