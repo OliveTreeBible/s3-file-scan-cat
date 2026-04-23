@@ -333,12 +333,17 @@ export class S3FileScanCat {
                         )
                         throw e
                     }
+                    // Always update the continuation token based on IsTruncated /
+                    // NextContinuationToken, regardless of whether this page returned Contents.
+                    // S3 can (rarely) return a truncated page with no Contents, and nesting the
+                    // token update under `if (response.Contents)` would cause the loop to exit
+                    // early and silently drop the rest of the key set.
+                    if (response.IsTruncated === true && response.NextContinuationToken !== undefined) {
+                        concatState.continuationToken = response.NextContinuationToken
+                    } else {
+                        concatState.continuationToken = undefined
+                    }
                     if (response.Contents) {
-                        if (response.IsTruncated === true && response.NextContinuationToken !== undefined) {
-                            concatState.continuationToken = response.NextContinuationToken
-                        } else {
-                            concatState.continuationToken = undefined
-                        }
                         for (const s3Object of response.Contents) {
                             if (s3Object.Size && s3Object.Key) {
                                 await waitUntil(() => {

@@ -70,6 +70,50 @@ describe('S3FileScanCat edges (mocked S3)', () => {
         expect(listCalls[1].args[0].input.ContinuationToken).toBe('tok-1')
     })
 
+    it('continues paginating when a truncated concat page returns no Contents', async () => {
+        let concatCalls = 0
+        stubPartitionAndConcatList((input) => {
+            concatCalls++
+            if (!input.ContinuationToken) {
+                // First page: truncated but empty. Before the fix, the token update was nested
+                // inside `if (response.Contents)`, so we never advanced and dropped page 2.
+                return {
+                    IsTruncated: true,
+                    NextContinuationToken: 'tok-empty',
+                }
+            }
+            return {
+                Contents: [{ Key: 'data/src/year=2020/late.json', Size: 8 }],
+                IsTruncated: false,
+            }
+        })
+
+        s3Mock.on(GetObjectCommand).callsFake(() =>
+            Promise.resolve({
+                Body: sdkStreamMixin(Readable.from(['{"late":true}'])),
+            })
+        )
+        s3Mock.on(PutObjectCommand).resolves({})
+
+        const cat = new S3FileScanCat(false, scannerOptions({ partitionStack: ['year'] }), testAwsSecrets)
+        await cat.scanAndProcessFiles('bucket', 'data/src', 'data/dst')
+
+        // We should have issued both the empty first page and the populated second page.
+        expect(concatCalls).toBe(2)
+        const concatListCalls = s3Mock
+            .commandCalls(ListObjectsV2Command)
+            .filter((c) => c.args[0].input.Delimiter === undefined)
+        expect(concatListCalls.length).toBe(2)
+        expect(concatListCalls[1].args[0].input.ContinuationToken).toBe('tok-empty')
+
+        // The object on the second page must have been fetched and written out.
+        expect(cat.s3ObjectsFetchedTotal).toBe(1)
+        expect(cat.s3ObjectsPutTotal).toBe(1)
+        const put = s3Mock.commandCalls(PutObjectCommand)[0].args[0].input
+        expect(put.Key).toBe('data/dst/year=2020/0.json.gz')
+        expect(gunzipSync(put.Body as Uint8Array).toString('utf8')).toBe('{"late":true}')
+    })
+
     it('flushes multiple gzip parts when maxFileSizeBytes is exceeded', async () => {
         stubPartitionAndConcatList(() => ({
             Contents: [
