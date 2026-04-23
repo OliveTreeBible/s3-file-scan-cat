@@ -62,6 +62,14 @@ export interface ConcatState {
      * Drained contiguously from `nextSeqToAppend` whenever a worker enters the buffer critical section.
      */
     pendingBodies: Map<number, string>
+    /**
+     * Number of `_getAndProcessObjectBody` workers currently running for THIS concatFilesAtPrefix
+     * invocation. Used for per-call backpressure against `s3ObjectBodyProcessInProgressLimit`, so
+     * that parallel `concatFilesAtPrefix` calls (if ever introduced) do not steal each other's
+     * concurrency budget or wait on each other's in-flight bodies. The class-level
+     * `_s3ObjectBodyProcessInProgress` counter is retained as a rollup for observability only.
+     */
+    bodiesInFlight: number
 }
 
 export interface PrefixEvalResult {

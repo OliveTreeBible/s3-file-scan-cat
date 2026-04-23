@@ -154,6 +154,78 @@ describe('S3FileScanCat edges (mocked S3)', () => {
         expect(bodies).toEqual(['{"a":1}\n', '{"b":2}\n'])
     })
 
+    it('backpressure is per-concatFilesAtPrefix call, not shared across parallel calls', async () => {
+        // Both prefixes list the same number of keys; their GetObject calls block until we say
+        // so. With a per-call limit of 1, sharing the counter (the pre-fix behavior) would mean
+        // the second concatFilesAtPrefix could not spawn ANY body worker until the first one
+        // released its single slot. With the fix, each call gets its own budget of 1.
+        const concatListed: Record<string, number> = {}
+        s3Mock.on(ListObjectsV2Command).callsFake((input) => {
+            if (input.Delimiter !== undefined) {
+                throw new Error(`Unexpected partition-scan list: ${input.Prefix}`)
+            }
+            const prefix = input.Prefix ?? ''
+            concatListed[prefix] = (concatListed[prefix] ?? 0) + 1
+            return Promise.resolve({
+                Contents: [
+                    { Key: `${prefix}a.json`, Size: 8 },
+                    { Key: `${prefix}b.json`, Size: 8 },
+                ],
+                IsTruncated: false,
+            })
+        })
+
+        const pendingResolvers: Array<(v: unknown) => void> = []
+        s3Mock.on(GetObjectCommand).callsFake(
+            () =>
+                new Promise((resolve) => {
+                    pendingResolvers.push(resolve as (v: unknown) => void)
+                })
+        )
+        s3Mock.on(PutObjectCommand).resolves({})
+
+        const cat = new S3FileScanCat(
+            false,
+            scannerOptions({
+                partitionStack: ['year'],
+                limits: { s3ObjectBodyProcessInProgressLimit: 1 },
+            }),
+            testAwsSecrets
+        )
+
+        const run1 = cat.concatFilesAtPrefix('bucket', 'data/src/year=2020', 'data/src', 'data/dst')
+        const run2 = cat.concatFilesAtPrefix('bucket', 'data/src/year=2021', 'data/src', 'data/dst')
+
+        // Each call should spawn exactly one body worker up to the limit. Across the two calls
+        // that is 2 pending GetObject calls. Poll briefly for them to be registered.
+        for (let i = 0; i < 50 && pendingResolvers.length < 2; i++) {
+            await new Promise((r) => setTimeout(r, 5))
+        }
+        expect(pendingResolvers.length).toBe(2)
+
+        // Sanity: the class-level rollup still reflects total in-flight bodies across calls.
+        expect(cat.s3ObjectBodyProcessInProgress).toBe(2)
+
+        // Release the first worker of each call; each call can then spawn the second.
+        pendingResolvers[0]({ Body: sdkStreamMixin(Readable.from(['{"x":1}'])) })
+        pendingResolvers[1]({ Body: sdkStreamMixin(Readable.from(['{"y":2}'])) })
+        for (let i = 0; i < 50 && pendingResolvers.length < 4; i++) {
+            await new Promise((r) => setTimeout(r, 5))
+        }
+        expect(pendingResolvers.length).toBe(4)
+        pendingResolvers[2]({ Body: sdkStreamMixin(Readable.from(['{"x":2}'])) })
+        pendingResolvers[3]({ Body: sdkStreamMixin(Readable.from(['{"y":3}'])) })
+
+        await Promise.all([run1, run2])
+
+        // Each prefix produced one put (2-body concat fits in the default max).
+        const putKeys = s3Mock.commandCalls(PutObjectCommand).map((c) => c.args[0].input.Key).sort()
+        expect(putKeys).toEqual(['data/dst/year=2020/0.json.gz', 'data/dst/year=2021/0.json.gz'])
+
+        // After everything settles, the rollup is back to zero.
+        expect(cat.s3ObjectBodyProcessInProgress).toBe(0)
+    })
+
     it('close() destroys the S3 client and keep-alive agents, and rejects further scans', async () => {
         const cat = new S3FileScanCat(false, scannerOptions({ partitionStack: ['year'] }), testAwsSecrets)
 
@@ -334,6 +406,7 @@ describe('S3FileScanCat edges (mocked S3)', () => {
             fileNumber: 0,
             nextSeqToAppend: 0,
             pendingBodies: new Map(),
+            bodiesInFlight: 0,
         }
         await expect(
             cat._getAndProcessObjectBody(
@@ -358,6 +431,7 @@ describe('S3FileScanCat edges (mocked S3)', () => {
             fileNumber: 0,
             nextSeqToAppend: 0,
             pendingBodies: new Map(),
+            bodiesInFlight: 0,
         }
         await expect(
             cat._getAndProcessObjectBody(

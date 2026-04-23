@@ -366,6 +366,7 @@ export class S3FileScanCat {
             _bufferMutex: Promise.resolve(),
             nextSeqToAppend: 0,
             pendingBodies: new Map(),
+            bodiesInFlight: 0,
         }
 
         // Monotonic listing-order sequence number assigned to each fetchable key.
@@ -427,8 +428,12 @@ export class S3FileScanCat {
                                     if (this._fatalScanError) {
                                         return true
                                     }
+                                    // Per-call backpressure: only this invocation's body workers
+                                    // count against the limit, so parallel concatFilesAtPrefix
+                                    // calls (if ever introduced) get their own concurrency budget
+                                    // instead of starving each other through a shared counter.
                                     if (
-                                        this._s3ObjectBodyProcessInProgress <
+                                        concatState.bodiesInFlight <
                                         this._s3ObjectBodyProcessInProgressLimit
                                     ) {
                                         return true
@@ -529,6 +534,10 @@ export class S3FileScanCat {
         destPrefix: string,
         seq: number
     ): Promise<void> {
+        // Per-call counter is authoritative for backpressure inside this concatFilesAtPrefix
+        // invocation. The class-level counter is retained as an aggregate rollup for the
+        // public `s3ObjectBodyProcessInProgress` getter.
+        concatState.bodiesInFlight++
         this._s3ObjectBodyProcessInProgress++
         void this._logger?.trace(
             `BEGIN _getObjectBody objectKey=${s3Key} - _s3ObjectBodyProcessCount: ${this._s3ObjectBodyProcessInProgress}`
@@ -646,6 +655,7 @@ export class S3FileScanCat {
                 unlockBuf()
             }
         } finally {
+            concatState.bodiesInFlight--
             this._s3ObjectBodyProcessInProgress--
             void this._logger?.trace(
                 `END _getObjectBody objectKey=${s3Key} - _s3ObjectBodyProcessCount: ${this._s3ObjectBodyProcessInProgress} - _s3ObjectsFetchedTotal: ${this._s3ObjectsFetchedTotal}`
