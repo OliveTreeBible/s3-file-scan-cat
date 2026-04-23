@@ -154,6 +154,85 @@ describe('S3FileScanCat edges (mocked S3)', () => {
         expect(bodies).toEqual(['{"a":1}\n', '{"b":2}\n'])
     })
 
+    it('fails fast without retrying on a non-retryable 4xx S3 error (_isRetryableError)', async () => {
+        stubPartitionAndConcatList(() => ({
+            Contents: [{ Key: 'data/src/year=2020/forbidden.json', Size: 8 }],
+            IsTruncated: false,
+        }))
+
+        const accessDenied = Object.assign(new Error('Access Denied'), {
+            name: 'AccessDenied',
+            $metadata: { httpStatusCode: 403 },
+        })
+        let getAttempts = 0
+        s3Mock.on(GetObjectCommand).callsFake(() => {
+            getAttempts++
+            return Promise.reject(accessDenied)
+        })
+
+        const cat = new S3FileScanCat(false, scannerOptions({ partitionStack: ['year'] }), testAwsSecrets)
+        const sleepSpy = vi.spyOn(cat, '_sleep').mockResolvedValue(undefined)
+
+        await expect(cat.scanAndProcessFiles('bucket', 'data/src', 'data/dst')).rejects.toThrow(
+            /Unexpected S3 getObject error/
+        )
+
+        // One attempt, no retries, no sleeps.
+        expect(getAttempts).toBe(1)
+        expect(sleepSpy).not.toHaveBeenCalled()
+    })
+
+    it('retries on 429 TooManyRequests (retryable 4xx)', async () => {
+        stubPartitionAndConcatList(() => ({
+            Contents: [{ Key: 'data/src/year=2020/throttled.json', Size: 8 }],
+            IsTruncated: false,
+        }))
+
+        const throttled = Object.assign(new Error('Too Many Requests'), {
+            name: 'TooManyRequestsException',
+            $metadata: { httpStatusCode: 429 },
+        })
+        let attempts = 0
+        s3Mock.on(GetObjectCommand).callsFake(() => {
+            attempts++
+            if (attempts < 3) {
+                return Promise.reject(throttled)
+            }
+            return Promise.resolve({
+                Body: sdkStreamMixin(Readable.from(['{"ok":true}'])),
+            })
+        })
+        s3Mock.on(PutObjectCommand).resolves({})
+
+        const cat = new S3FileScanCat(false, scannerOptions({ partitionStack: ['year'] }), testAwsSecrets)
+        const sleepSpy = vi.spyOn(cat, '_sleep').mockResolvedValue(undefined)
+
+        await cat.scanAndProcessFiles('bucket', 'data/src', 'data/dst')
+
+        expect(attempts).toBe(3)
+        expect(sleepSpy).toHaveBeenCalledTimes(2)
+    })
+
+    it('_getWaitTimeForRetry applies exponential backoff with equal jitter (no zero-ms first retry)', () => {
+        const cat = new S3FileScanCat(false, scannerOptions({ partitionStack: ['year'] }), testAwsSecrets)
+
+        // Equal jitter: result ∈ [cap/2, cap], where cap = 2^retryCount * 100.
+        // retryCount=0 -> [50, 100]; retryCount=1 -> [100, 200]; retryCount=5 -> [1600, 3200].
+        for (const retry of [0, 1, 2, 5]) {
+            const cap = Math.pow(2, retry) * 100
+            const half = cap / 2
+            for (let i = 0; i < 100; i++) {
+                const wait = cat._getWaitTimeForRetry(retry)
+                expect(wait).toBeGreaterThanOrEqual(half)
+                expect(wait).toBeLessThanOrEqual(cap)
+            }
+        }
+        // Specifically, retry 0 must never be zero anymore.
+        for (let i = 0; i < 200; i++) {
+            expect(cat._getWaitTimeForRetry(0)).toBeGreaterThan(0)
+        }
+    })
+
     it('retries GetObject with backoff until success', async () => {
         stubPartitionAndConcatList(() => ({
             Contents: [{ Key: 'data/src/year=2020/x.json', Size: 12 }],

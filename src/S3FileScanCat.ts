@@ -490,6 +490,16 @@ export class S3FileScanCat {
                 } catch (error) {
                     void this._logger?.error(`[ERROR] S3 getObjectFailed: ${error}`)
                     lastError = error
+                    // Bail out immediately on client errors that cannot be resolved by
+                    // retrying (403 AccessDenied, 404 NoSuchKey, etc.). Without this the
+                    // full ~13-minute backoff ladder fires for errors the caller already
+                    // knows will keep failing.
+                    if (!this._isRetryableError(error)) {
+                        void this._logger?.warn(
+                            `Non-retryable S3 error for key=${s3Key}; skipping retries. Error: ${error instanceof Error ? error.message : String(error)}`
+                        )
+                        break
+                    }
                     if (retryCount < MAX_RETRIES) {
                         void this._logger?.warn(
                             `STATUS RETRY! _getAndProcessObjectBody s3Key=${s3Key} - _s3ObjectBodyProcessCount: ${this._s3ObjectBodyProcessInProgress} - retryCount: ${retryCount}`
@@ -623,10 +633,43 @@ export class S3FileScanCat {
         })
     }
 
-    // Provides an exponential backoff for wait times when s3 commands fail.
-    _getWaitTimeForRetry(retryCount: number) {
-        if (retryCount === 0) return 0
-        return Math.pow(2, retryCount) * 100
+    /**
+     * Exponential backoff with equal jitter.
+     *
+     * Returns a value in the range `[cap/2, cap]` where `cap = 2^retryCount * 100` ms, so:
+     *  - retryCount=0  -> 50-100ms   (previously 0ms, which defeated backoff entirely)
+     *  - retryCount=1  -> 100-200ms
+     *  - retryCount=13 -> ~6.8-13.65 min (matches the prior documented upper bound)
+     *
+     * Equal jitter keeps a guaranteed minimum wait (unlike full jitter, which can return 0)
+     * while still spreading concurrent retries to avoid synchronized thundering-herd storms
+     * against the same S3 endpoint.
+     */
+    _getWaitTimeForRetry(retryCount: number): number {
+        const cap = Math.pow(2, retryCount) * 100
+        const half = cap / 2
+        return Math.floor(half + Math.random() * half)
+    }
+
+    /**
+     * Returns false when the error is a client-side failure that retrying cannot fix
+     * (4xx except 408 RequestTimeout and 429 TooManyRequests). Unknown / network / 5xx
+     * errors remain retryable.
+     */
+    _isRetryableError(err: unknown): boolean {
+        if (err && typeof err === 'object') {
+            const status = (err as { $metadata?: { httpStatusCode?: number } }).$metadata
+                ?.httpStatusCode
+            if (typeof status === 'number') {
+                if (status === 408 || status === 429) {
+                    return true
+                }
+                if (status >= 400 && status < 500) {
+                    return false
+                }
+            }
+        }
+        return true
     }
 
     async _flushBuffer(
