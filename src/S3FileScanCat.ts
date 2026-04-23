@@ -320,69 +320,74 @@ export class S3FileScanCat {
         void this._logger?.trace(
             `BEGIN _getObjectBody objectKey=${s3Key} - _s3ObjectBodyProcessCount: ${this._s3ObjectBodyProcessInProgress}`
         )
-        let response: undefined | GetObjectCommandOutput
-        let retryCount = 0
-        // With exponential backoff the last retry waits ~13 minutes.  This gives the system a chance to recover after a failure but also allows us to move on if we can resolve this in a reasonable amount of time
-        const MAX_RETRIES = 14
-        let lastError: unknown
-        while (!response) {
-            try {
-                response = await this._s3Client.send(
-                    new GetObjectCommand({
-                        Bucket: bucket,
-                        Key: s3Key,
-                    })
-                )
-                lastError = undefined
-            } catch (error) {
-                void this._logger?.error(`[ERROR] S3 getObjectFailed: ${error}`)
-                lastError = error
-                if (retryCount < MAX_RETRIES) {
-                    void this._logger?.warn(
-                        `STATUS RETRY! _getAndProcessObjectBody s3Key=${s3Key} - _s3ObjectBodyProcessCount: ${this._s3ObjectBodyProcessInProgress} - retryCount: ${retryCount}`
+        try {
+            let response: undefined | GetObjectCommandOutput
+            let retryCount = 0
+            // With exponential backoff the last retry waits ~13 minutes.  This gives the system a chance to recover after a failure but also allows us to move on if we can resolve this in a reasonable amount of time
+            const MAX_RETRIES = 14
+            let lastError: unknown
+            while (!response) {
+                try {
+                    response = await this._s3Client.send(
+                        new GetObjectCommand({
+                            Bucket: bucket,
+                            Key: s3Key,
+                        })
                     )
-                    await this._sleep(this._getWaitTimeForRetry(retryCount++))
-                } else {
-                    break
+                    lastError = undefined
+                } catch (error) {
+                    void this._logger?.error(`[ERROR] S3 getObjectFailed: ${error}`)
+                    lastError = error
+                    if (retryCount < MAX_RETRIES) {
+                        void this._logger?.warn(
+                            `STATUS RETRY! _getAndProcessObjectBody s3Key=${s3Key} - _s3ObjectBodyProcessCount: ${this._s3ObjectBodyProcessInProgress} - retryCount: ${retryCount}`
+                        )
+                        await this._sleep(this._getWaitTimeForRetry(retryCount++))
+                    } else {
+                        break
+                    }
                 }
             }
-        }
-        void this._logger?.trace(
-            `STATUS _getObjectBody s3Key=${s3Key} - _s3ObjectBodyProcessCount: ${this._s3ObjectBodyProcessInProgress}`
-        )
-        if (response === undefined) {
-            throw new Error(`[ERROR]: Unexpected S3 getObject error encountered ${s3Key}:${lastError ? lastError : ''}`)
-        } else if (!response.Body) {
-            throw new Error(`[ERROR]: Missing response data for object ${s3Key}`)
-        }
-        const objectBodyStr = await response.Body.transformToString()
-        this._s3ObjectsFetchedTotal++
-
-        if (objectBodyStr.length > 0) {
-            if (
-                concatState.buffer &&
-                concatState.buffer.length + objectBodyStr.length > this._maxFileSizeBytes
-            ) {
-                this._flushBuffer(
-                    bucket,
-                    concatState.buffer,
-                    prefix,
-                    srcPrefix,
-                    destPrefix,
-                    concatState.fileNumber++
+            void this._logger?.trace(
+                `STATUS _getObjectBody s3Key=${s3Key} - _s3ObjectBodyProcessCount: ${this._s3ObjectBodyProcessInProgress}`
+            )
+            if (response === undefined) {
+                throw new Error(
+                    `[ERROR]: Unexpected S3 getObject error encountered ${s3Key}:${lastError ? lastError : ''}`
                 )
-                concatState.buffer = undefined
+            } else if (!response.Body) {
+                throw new Error(`[ERROR]: Missing response data for object ${s3Key}`)
             }
-            if (concatState.buffer) {
-                concatState.buffer += '\n' + objectBodyStr
-            } else {
-                concatState.buffer = objectBodyStr
+            const objectBodyStr = await response.Body.transformToString()
+            this._s3ObjectsFetchedTotal++
+
+            if (objectBodyStr.length > 0) {
+                if (
+                    concatState.buffer &&
+                    concatState.buffer.length + objectBodyStr.length > this._maxFileSizeBytes
+                ) {
+                    this._flushBuffer(
+                        bucket,
+                        concatState.buffer,
+                        prefix,
+                        srcPrefix,
+                        destPrefix,
+                        concatState.fileNumber++
+                    )
+                    concatState.buffer = undefined
+                }
+                if (concatState.buffer) {
+                    concatState.buffer += '\n' + objectBodyStr
+                } else {
+                    concatState.buffer = objectBodyStr
+                }
             }
+        } finally {
+            this._s3ObjectBodyProcessInProgress--
+            void this._logger?.trace(
+                `END _getObjectBody objectKey=${s3Key} - _s3ObjectBodyProcessCount: ${this._s3ObjectBodyProcessInProgress} - _s3ObjectsFetchedTotal: ${this._s3ObjectsFetchedTotal}`
+            )
         }
-        this._s3ObjectBodyProcessInProgress--
-        void this._logger?.trace(
-            `END _getObjectBody objectKey=${s3Key} - _s3ObjectBodyProcessCount: ${this._s3ObjectBodyProcessInProgress} - _s3ObjectsFetchedTotal: ${this._s3ObjectsFetchedTotal}`
-        )
     }
 
     _sleep(milliseconds: number): Promise<void> {
