@@ -4,7 +4,22 @@ export function utcDayStartMs(ymd: string): number {
     if (!m) {
         throw new RangeError(`Invalid date (expected YYYY-MM-DD): ${ymd}`)
     }
-    return Date.UTC(Number(m[1]), Number(m[2]) - 1, Number(m[3]))
+
+    const year = Number(m[1])
+    const month = Number(m[2])
+    const day = Number(m[3])
+    const t = Date.UTC(year, month - 1, day)
+    const d = new Date(t)
+
+    if (
+        d.getUTCFullYear() !== year ||
+        d.getUTCMonth() !== month - 1 ||
+        d.getUTCDate() !== day
+    ) {
+        throw new RangeError(`Invalid date (expected YYYY-MM-DD): ${ymd}`)
+    }
+
+    return t
 }
 
 export function formatUtcYmdParts(t: number): { year: string; month: string; day: string } {
