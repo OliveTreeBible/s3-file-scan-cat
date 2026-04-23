@@ -182,6 +182,53 @@ describe('S3FileScanCat edges (mocked S3)', () => {
         ).rejects.toThrow('Missing response data for object')
     })
 
+    it('with bounds and partitionStack=[year,month,day], skips partition scan and concats directly under the day prefix', async () => {
+        const concatListInputs: Array<{ Prefix?: string; ContinuationToken?: string }> = []
+        s3Mock.on(ListObjectsV2Command).callsFake((input) => {
+            if (input.Delimiter === '/') {
+                throw new Error(
+                    `Unexpected partition-scan list call when day is the leaf (Prefix=${input.Prefix})`
+                )
+            }
+            concatListInputs.push({ Prefix: input.Prefix, ContinuationToken: input.ContinuationToken })
+            return Promise.resolve({
+                Contents: [{ Key: `${input.Prefix}a.json`, Size: 7 }],
+                IsTruncated: false,
+            })
+        })
+
+        s3Mock.on(GetObjectCommand).callsFake(() =>
+            Promise.resolve({
+                Body: sdkStreamMixin(Readable.from(['{"v":1}'])),
+            })
+        )
+        s3Mock.on(PutObjectCommand).resolves({})
+
+        const cat = new S3FileScanCat(
+            false,
+            scannerOptions({
+                partitionStack: ['year', 'month', 'day'],
+                bounds: { startDate: '2020-01-01', endDate: '2020-01-02' },
+            }),
+            testAwsSecrets
+        )
+
+        await cat.scanAndProcessFiles('bucket', 'data/src', 'data/dst')
+
+        expect(cat.isDone).toBe(true)
+        expect(cat.prefixesProcessedTotal).toBe(2)
+        expect(concatListInputs.map((c) => c.Prefix).sort()).toEqual([
+            'data/src/year=2020/month=01/day=01/',
+            'data/src/year=2020/month=01/day=02/',
+        ])
+
+        const putKeys = s3Mock.commandCalls(PutObjectCommand).map((c) => c.args[0].input.Key).sort()
+        expect(putKeys).toEqual([
+            'data/dst/year=2020/month=01/day=01/0.json.gz',
+            'data/dst/year=2020/month=01/day=02/0.json.gz',
+        ])
+    })
+
     it('throws on invalid list content entry without Key', async () => {
         stubPartitionAndConcatList(() => ({
             Contents: [{ Size: 5 }],

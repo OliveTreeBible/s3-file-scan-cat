@@ -150,17 +150,39 @@ export class S3FileScanCat {
         )
         const destPath = destPrefix
         if (this._scannerOptions.bounds?.startDate && this._scannerOptions.bounds.endDate) {
+            const stack = this._scannerOptions.partitionStack
+            const expectedDateParts = ['year', 'month', 'day'] as const
+            if (
+                stack.length < expectedDateParts.length ||
+                stack[0] !== expectedDateParts[0] ||
+                stack[1] !== expectedDateParts[1] ||
+                stack[2] !== expectedDateParts[2]
+            ) {
+                throw new Error(
+                    `When bounds are set, partitionStack must begin with ['year','month','day']; received ${JSON.stringify(stack)}`
+                )
+            }
+            const remainingStack = stack.slice(expectedDateParts.length)
+            const normalizedSrc = srcPrefix.endsWith('/') ? srcPrefix : `${srcPrefix}/`
             const startMs = utcDayStartMs(this._scannerOptions.bounds.startDate)
             const endMs = utcDayStartMs(this._scannerOptions.bounds.endDate)
             for (let t = startMs; t <= endMs; t += MS_PER_DAY) {
                 const { year, month, day } = formatUtcYmdParts(t)
-                this._keyParams.push({
-                    bucket,
-                    prefix: srcPrefix,
-                    curPrefix: `${srcPrefix.endsWith('/') ? srcPrefix : srcPrefix + '/'}year=${year}/month=${month}/day=${day}` /* This changes as we traverse down the path, srcPrefix is where we start */,
-                    partitionStack: this._scannerOptions.partitionStack.slice(3), // drop off the first three partitions since we are accounting from them here.
-                    bounds: this._scannerOptions.bounds,
-                })
+                const datePrefix = `${normalizedSrc}year=${year}/month=${month}/day=${day}`
+                if (remainingStack.length === 0) {
+                    // Day is already the leaf partition; skip further scanning and
+                    // feed the prefix straight into the concat phase.
+                    this._allPrefixes.push(datePrefix)
+                } else {
+                    this._keyParams.push({
+                        bucket,
+                        prefix: srcPrefix,
+                        curPrefix: datePrefix,
+                        // Fresh copy per iteration because _scanPrefixForPartitions mutates via shift().
+                        partitionStack: remainingStack.slice(),
+                        bounds: this._scannerOptions.bounds,
+                    })
+                }
             }
         } else {
             this._keyParams.push({

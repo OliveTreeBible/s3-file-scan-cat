@@ -9,11 +9,27 @@ describe('S3FileScanCat.scanAndProcessFiles (empty prefixes)', () => {
         const cat = new S3FileScanCat(
             false,
             scannerOptions({
+                partitionStack: ['year', 'month', 'day'],
                 bounds: { startDate: '2020-01-02', endDate: '2020-01-01' },
             }),
             testAwsSecrets
         )
 
         await expect(cat.scanAndProcessFiles('bucket', 'data/src', 'data/dst')).rejects.toThrow(EmptyPrefixError)
+    })
+
+    it('rejects bounds with a partitionStack that does not start with year/month/day', async () => {
+        const cat = new S3FileScanCat(
+            false,
+            scannerOptions({
+                partitionStack: ['year', 'month'],
+                bounds: { startDate: '2020-01-01', endDate: '2020-01-01' },
+            }),
+            testAwsSecrets
+        )
+
+        await expect(cat.scanAndProcessFiles('bucket', 'data/src', 'data/dst')).rejects.toThrow(
+            /partitionStack must begin with/
+        )
     })
 })
