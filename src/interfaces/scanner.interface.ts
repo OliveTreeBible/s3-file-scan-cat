@@ -51,6 +51,17 @@ export interface ConcatState {
     fileNumber: number
     /** Tail of a promise chain; serializes buffer append/flush for concurrent object workers. */
     _bufferMutex?: Promise<void>
+    /**
+     * Monotonic sequence number of the next key to append. Guarantees that output bodies are
+     * concatenated in the order S3 returned them (lexicographic / chronological), independent of
+     * the order in which the concurrent workers actually finish fetching.
+     */
+    nextSeqToAppend: number
+    /**
+     * Bodies that have already been fetched but whose listing-order predecessor hasn't landed yet.
+     * Drained contiguously from `nextSeqToAppend` whenever a worker enters the buffer critical section.
+     */
+    pendingBodies: Map<number, string>
 }
 
 export interface PrefixEvalResult {

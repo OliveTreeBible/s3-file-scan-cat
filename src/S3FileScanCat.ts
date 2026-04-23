@@ -294,7 +294,14 @@ export class S3FileScanCat {
             continuationToken: undefined,
             fileNumber: 0,
             _bufferMutex: Promise.resolve(),
+            nextSeqToAppend: 0,
+            pendingBodies: new Map(),
         }
+
+        // Monotonic listing-order sequence number assigned to each fetchable key.
+        // Keys skipped due to zero size do not consume a seq slot (there is nothing
+        // to append for them), which keeps the contiguous-drain logic simple.
+        let nextSeq = 0
 
         // Track every spawned body-processor so we can guarantee they have all
         // settled before this method returns. Without this, a fatal error would
@@ -364,6 +371,10 @@ export class S3FileScanCat {
                                 if (this._fatalScanError) {
                                     break
                                 }
+                                // Assign the listing-order sequence BEFORE spawning so that even
+                                // if workers finish out of order the append path can reassemble
+                                // them in S3's lexicographic/chronological order.
+                                const seq = nextSeq++
                                 // We purposely do not await on this - the waitUntil above limits the number of these
                                 // calls that are in progress at any given moment. The promise is tracked in
                                 // `inFlightBodies` so the finally block can await it before returning.
@@ -373,7 +384,8 @@ export class S3FileScanCat {
                                     concatState,
                                     prefix,
                                     srcPrefix,
-                                    destPrefix
+                                    destPrefix,
+                                    seq
                                 )
                                     .catch((err: unknown) => {
                                         void this._logger?.error(
@@ -444,7 +456,8 @@ export class S3FileScanCat {
         concatState: ConcatState,
         prefix: string,
         srcPrefix: string,
-        destPrefix: string
+        destPrefix: string,
+        seq: number
     ): Promise<void> {
         this._s3ObjectBodyProcessInProgress++
         void this._logger?.trace(
@@ -503,12 +516,24 @@ export class S3FileScanCat {
             const objectBodyStr = await response.Body.transformToString()
             this._s3ObjectsFetchedTotal++
 
-            if (objectBodyStr.length > 0) {
-                const unlockBuf = await this._acquireConcatBufferLock(concatState)
-                try {
+            // Deposit the fetched body at its listing-order slot and drain every contiguous
+            // slot that is ready. Empty bodies still occupy a slot so subsequent, non-empty
+            // bodies can advance past them without the drain loop stalling. Holding the
+            // mutex across the optional flush call is deliberate: it keeps buffer/flush
+            // interleavings serialized. Performance of that trade-off is tracked separately.
+            const unlockBuf = await this._acquireConcatBufferLock(concatState)
+            try {
+                concatState.pendingBodies.set(seq, objectBodyStr)
+                while (concatState.pendingBodies.has(concatState.nextSeqToAppend)) {
+                    const bodyStr = concatState.pendingBodies.get(concatState.nextSeqToAppend) as string
+                    concatState.pendingBodies.delete(concatState.nextSeqToAppend)
+                    concatState.nextSeqToAppend++
+                    if (bodyStr.length === 0) {
+                        continue
+                    }
                     if (
                         concatState.buffer &&
-                        concatState.buffer.length + objectBodyStr.length > this._maxFileSizeBytes
+                        concatState.buffer.length + bodyStr.length > this._maxFileSizeBytes
                     ) {
                         await this._flushBuffer(
                             bucket,
@@ -521,13 +546,13 @@ export class S3FileScanCat {
                         concatState.buffer = undefined
                     }
                     if (concatState.buffer) {
-                        concatState.buffer += '\n' + objectBodyStr
+                        concatState.buffer += '\n' + bodyStr
                     } else {
-                        concatState.buffer = objectBodyStr
+                        concatState.buffer = bodyStr
                     }
-                } finally {
-                    unlockBuf()
                 }
+            } finally {
+                unlockBuf()
             }
         } finally {
             this._s3ObjectBodyProcessInProgress--

@@ -6,6 +6,7 @@ import { sdkStreamMixin } from '@smithy/util-stream'
 import { mockClient } from 'aws-sdk-client-mock'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
+import type { ConcatState } from '../src/interfaces/scanner.interface.js'
 import { S3FileScanCat } from '../src/S3FileScanCat.js'
 import { scannerOptions, testAwsSecrets } from './testDefaults.js'
 
@@ -196,7 +197,13 @@ describe('S3FileScanCat edges (mocked S3)', () => {
         const cat = new S3FileScanCat(false, scannerOptions({ partitionStack: ['year'] }), testAwsSecrets)
         vi.spyOn(cat, '_sleep').mockResolvedValue(undefined)
 
-        const concatState = { buffer: undefined as string | undefined, continuationToken: undefined, fileNumber: 0 }
+        const concatState: ConcatState = {
+            buffer: undefined,
+            continuationToken: undefined,
+            fileNumber: 0,
+            nextSeqToAppend: 0,
+            pendingBodies: new Map(),
+        }
         await expect(
             cat._getAndProcessObjectBody(
                 'bucket',
@@ -204,7 +211,8 @@ describe('S3FileScanCat edges (mocked S3)', () => {
                 concatState,
                 'data/src/year=2020',
                 'data/src',
-                'data/dst'
+                'data/dst',
+                0
             )
         ).rejects.toThrow(/Unexpected S3 getObject error/)
     })
@@ -213,7 +221,13 @@ describe('S3FileScanCat edges (mocked S3)', () => {
         s3Mock.on(GetObjectCommand).resolves({})
 
         const cat = new S3FileScanCat(false, scannerOptions({ partitionStack: ['year'] }), testAwsSecrets)
-        const concatState = { buffer: undefined as string | undefined, continuationToken: undefined, fileNumber: 0 }
+        const concatState: ConcatState = {
+            buffer: undefined,
+            continuationToken: undefined,
+            fileNumber: 0,
+            nextSeqToAppend: 0,
+            pendingBodies: new Map(),
+        }
         await expect(
             cat._getAndProcessObjectBody(
                 'bucket',
@@ -221,7 +235,8 @@ describe('S3FileScanCat edges (mocked S3)', () => {
                 concatState,
                 'data/src/year=2020',
                 'data/src',
-                'data/dst'
+                'data/dst',
+                0
             )
         ).rejects.toThrow('Missing response data for object')
     })
@@ -473,6 +488,60 @@ describe('S3FileScanCat edges (mocked S3)', () => {
         expect(cat.prefixesProcessedTotal).toBe(1)
         expect(cat.totalPrefixesToProcess).toBe(1)
         expect(cat.s3ObjectsPutTotal).toBe(1)
+    })
+
+    it('concatenates bodies in S3 listing order even when GetObject completes out of order', async () => {
+        stubPartitionAndConcatList(() => ({
+            // S3 returns keys in lexicographic order. Our output must follow this order.
+            Contents: [
+                { Key: 'data/src/year=2020/a.json', Size: 8 },
+                { Key: 'data/src/year=2020/b.json', Size: 8 },
+                { Key: 'data/src/year=2020/c.json', Size: 8 },
+            ],
+            IsTruncated: false,
+        }))
+
+        // Invert completion order: 'c' resolves first, then 'b', then 'a'.
+        // Before the fix this would have produced '{"c":3}\n{"b":2}\n{"a":1}'.
+        const resolvers = new Map<string, (v: unknown) => void>()
+        s3Mock.on(GetObjectCommand).callsFake(
+            (input) =>
+                new Promise((resolve) => {
+                    resolvers.set(input.Key!, resolve as (v: unknown) => void)
+                })
+        )
+        s3Mock.on(PutObjectCommand).resolves({})
+
+        const cat = new S3FileScanCat(false, scannerOptions({ partitionStack: ['year'] }), testAwsSecrets)
+        const run = cat.scanAndProcessFiles('bucket', 'data/src', 'data/dst')
+
+        // Wait for all three GetObject calls to be registered, then resolve in reverse order.
+        const waitForKey = async (key: string) => {
+            for (let i = 0; i < 50 && !resolvers.has(key); i++) {
+                await new Promise((r) => setTimeout(r, 5))
+            }
+        }
+        await waitForKey('data/src/year=2020/a.json')
+        await waitForKey('data/src/year=2020/b.json')
+        await waitForKey('data/src/year=2020/c.json')
+
+        resolvers.get('data/src/year=2020/c.json')!({
+            Body: sdkStreamMixin(Readable.from(['{"c":3}'])),
+        })
+        resolvers.get('data/src/year=2020/b.json')!({
+            Body: sdkStreamMixin(Readable.from(['{"b":2}'])),
+        })
+        resolvers.get('data/src/year=2020/a.json')!({
+            Body: sdkStreamMixin(Readable.from(['{"a":1}'])),
+        })
+
+        await run
+
+        expect(cat.s3ObjectsPutTotal).toBe(1)
+        const put = s3Mock.commandCalls(PutObjectCommand)[0].args[0].input
+        expect(put.Key).toBe('data/dst/year=2020/0.json.gz')
+        const plain = gunzipSync(put.Body as Uint8Array).toString('utf8')
+        expect(plain).toBe('{"a":1}\n{"b":2}\n{"c":3}')
     })
 
     it('does not leak _s3PrefixListObjectsProcessCount when concat ListObjectsV2 throws', async () => {
