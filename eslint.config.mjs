@@ -1,6 +1,11 @@
+import path from 'node:path'
+import { fileURLToPath } from 'node:url'
+
 import eslint from '@eslint/js'
 import eslintConfigPrettier from 'eslint-config-prettier'
 import tseslint from 'typescript-eslint'
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url))
 
 export default tseslint.config(
     eslint.configs.recommended,
@@ -14,7 +19,7 @@ export default tseslint.config(
         languageOptions: {
             parserOptions: {
                 projectService: true,
-                tsconfigRootDir: import.meta.dirname,
+                tsconfigRootDir: __dirname,
             },
         },
     }
