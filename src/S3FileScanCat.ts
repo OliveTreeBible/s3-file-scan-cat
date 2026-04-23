@@ -23,26 +23,28 @@ const MAX_LIST_KEYS = 1000
 
 export class S3FileScanCat {
     private _logger?: Logger
-    private _delimiter: string
-    private _keyParams: PrefixParams[]
-    private _allPrefixes: string[]
-    private _scanPrefixForPartitionsProcessCount: number
-    private _s3PrefixListObjectsProcessCount: number
-    private _totalPrefixesToProcess: number
-    private _s3ObjectBodyProcessInProgress: number
-    private _s3ObjectPutProcessCount: number
-    private _prefixesProcessedTotal: number
-    private _s3ObjectsFetchedTotal: number
-    private _s3ObjectsPutTotal: number
-    private _isDone: boolean
+    private _delimiter: string = '/'
+    private _keyParams: PrefixParams[] = []
+    private _allPrefixes: string[] = []
+    private _scanPrefixForPartitionsProcessCount: number = 0
+    private _s3PrefixListObjectsProcessCount: number = 0
+    private _totalPrefixesToProcess: number = 0
+    private _s3ObjectBodyProcessInProgress: number = 0
+    private _s3ObjectPutProcessCount: number = 0
+    private _prefixesProcessedTotal: number = 0
+    private _s3ObjectsFetchedTotal: number = 0
+    private _s3ObjectsPutTotal: number = 0
+    private _isDone: boolean = false
     /** Set on first background failure so wait loops can exit and the scan rejects cleanly. */
-    private _fatalScanError: Error | undefined
+    private _fatalScanError: Error | undefined = undefined
     /**
      * Tracks every in-flight `_scanPrefixForPartitions` promise so that when the scan aborts
      * (fatal error or normal completion) we can await them all before returning. Without this
      * the caller would see a rejection while background scans were still mutating shared state.
      */
-    private _inFlightPartitionScans: Set<Promise<void>>
+    private _inFlightPartitionScans: Set<Promise<void>> = new Set()
+    /** Guards against concurrent/re-entrant calls to `scanAndProcessFiles`. */
+    private _isRunning: boolean = false
     private _s3ObjectBodyProcessInProgressLimit: number
     private _maxFileSizeBytes: number
     private _scannerOptions: ScannerOptions
@@ -55,20 +57,6 @@ export class S3FileScanCat {
                 name: 'file-scan-cat',
             })
         }
-        this._delimiter = '/'
-        this._keyParams = []
-        this._allPrefixes = []
-        this._scanPrefixForPartitionsProcessCount = 0
-        this._s3PrefixListObjectsProcessCount = 0
-        this._totalPrefixesToProcess = 0
-        this._s3ObjectBodyProcessInProgress = 0
-        this._s3ObjectPutProcessCount = 0
-        this._prefixesProcessedTotal = 0
-        this._s3ObjectsFetchedTotal = 0
-        this._s3ObjectsPutTotal = 0
-        this._isDone = false
-        this._fatalScanError = undefined
-        this._inFlightPartitionScans = new Set()
         this._s3ObjectBodyProcessInProgressLimit =
             scannerOptions.limits?.s3ObjectBodyProcessInProgressLimit !== undefined
                 ? scannerOptions.limits?.s3ObjectBodyProcessInProgressLimit
@@ -151,7 +139,27 @@ export class S3FileScanCat {
     }
 
     async scanAndProcessFiles(bucket: string, srcPrefix: string, destPrefix: string): Promise<void> {
-        this._fatalScanError = undefined
+        if (this._isRunning) {
+            throw new Error(
+                'scanAndProcessFiles is already running on this instance; await the existing call or construct a new S3FileScanCat.'
+            )
+        }
+        // Reset per-run state so that prior runs (successful or failed) cannot leak
+        // queue contents, counters, `_isDone`, or `_fatalScanError` into this invocation.
+        this._resetRunState()
+        this._isRunning = true
+        try {
+            return await this._runScanAndProcessFiles(bucket, srcPrefix, destPrefix)
+        } finally {
+            this._isRunning = false
+        }
+    }
+
+    private async _runScanAndProcessFiles(
+        bucket: string,
+        srcPrefix: string,
+        destPrefix: string
+    ): Promise<void> {
         void this._logger?.trace(
             `BEGIN scanConcatenateCopy srcPrefix=${srcPrefix}:destPrefix=${destPrefix}:partitionStack=${this._scannerOptions.partitionStack}`
         )
@@ -196,7 +204,9 @@ export class S3FileScanCat {
                 bucket,
                 prefix: srcPrefix,
                 curPrefix: srcPrefix /* This changes as we traverse down the path, srcPrefix is where we start */,
-                partitionStack: this._scannerOptions.partitionStack,
+                // Clone the stack because _scanPrefixForPartitions mutates it via shift();
+                // without this, re-running on the same instance would see an empty stack.
+                partitionStack: this._scannerOptions.partitionStack.slice(),
                 bounds: this._scannerOptions.bounds,
             })
         }
@@ -249,7 +259,6 @@ export class S3FileScanCat {
         if (this._fatalScanError) {
             throw this._fatalScanError
         }
-        this._prefixesProcessedTotal = 0
         this._totalPrefixesToProcess = this._allPrefixes.length
         if (this._allPrefixes.length > 0) {
             while (this._allPrefixes.length > 0) {
@@ -508,6 +517,27 @@ export class S3FileScanCat {
             return
         }
         this._fatalScanError = err instanceof Error ? err : new Error(String(err))
+    }
+
+    /**
+     * Reset every per-run field so the instance can be safely reused across
+     * multiple `scanAndProcessFiles` invocations (including after a failure).
+     * Fields tied to configuration (S3 client, logger, limits) are preserved.
+     */
+    private _resetRunState(): void {
+        this._keyParams = []
+        this._allPrefixes = []
+        this._scanPrefixForPartitionsProcessCount = 0
+        this._s3PrefixListObjectsProcessCount = 0
+        this._totalPrefixesToProcess = 0
+        this._s3ObjectBodyProcessInProgress = 0
+        this._s3ObjectPutProcessCount = 0
+        this._prefixesProcessedTotal = 0
+        this._s3ObjectsFetchedTotal = 0
+        this._s3ObjectsPutTotal = 0
+        this._isDone = false
+        this._fatalScanError = undefined
+        this._inFlightPartitionScans = new Set()
     }
 
     /** Serialize buffer reads/writes/flushes across concurrent `_getAndProcessObjectBody` calls. */

@@ -356,4 +356,109 @@ describe('S3FileScanCat edges (mocked S3)', () => {
         expect(cat.s3ObjectsPutTotal).toBe(0)
         expect(cat.s3ObjectBodyProcessInProgress).toBe(0)
     })
+
+    it('resets per-run state so the same instance can be reused across successful runs', async () => {
+        stubPartitionAndConcatList(() => ({
+            Contents: [{ Key: 'data/src/year=2020/a.json', Size: 8 }],
+            IsTruncated: false,
+        }))
+        s3Mock.on(GetObjectCommand).callsFake(() =>
+            Promise.resolve({
+                Body: sdkStreamMixin(Readable.from(['{"x":1}'])),
+            })
+        )
+        s3Mock.on(PutObjectCommand).resolves({})
+
+        const cat = new S3FileScanCat(false, scannerOptions({ partitionStack: ['year'] }), testAwsSecrets)
+
+        await cat.scanAndProcessFiles('bucket', 'data/src', 'data/dst')
+        expect(cat.isDone).toBe(true)
+        expect(cat.s3ObjectsPutTotal).toBe(1)
+        expect(cat.s3ObjectsFetchedTotal).toBe(1)
+        expect(cat.prefixesProcessedTotal).toBe(1)
+        expect(cat.totalPrefixesToProcess).toBe(1)
+
+        // Second run against the same instance should zero the per-run counters before starting,
+        // not double them.
+        await cat.scanAndProcessFiles('bucket', 'data/src', 'data/dst')
+        expect(cat.isDone).toBe(true)
+        expect(cat.s3ObjectsPutTotal).toBe(1)
+        expect(cat.s3ObjectsFetchedTotal).toBe(1)
+        expect(cat.prefixesProcessedTotal).toBe(1)
+        expect(cat.totalPrefixesToProcess).toBe(1)
+    })
+
+    it('allows a retry on the same instance after a failed run', async () => {
+        let callCount = 0
+        s3Mock.on(ListObjectsV2Command).callsFake((input) => {
+            if (input.Delimiter === '/') {
+                callCount++
+                if (callCount === 1) {
+                    return Promise.reject(new Error('transient list failure'))
+                }
+                return Promise.resolve({
+                    CommonPrefixes: [{ Prefix: 'data/src/year=2020/' }],
+                    IsTruncated: false,
+                })
+            }
+            return Promise.resolve({
+                Contents: [{ Key: 'data/src/year=2020/a.json', Size: 8 }],
+                IsTruncated: false,
+            })
+        })
+        s3Mock.on(GetObjectCommand).callsFake(() =>
+            Promise.resolve({
+                Body: sdkStreamMixin(Readable.from(['{"x":1}'])),
+            })
+        )
+        s3Mock.on(PutObjectCommand).resolves({})
+
+        const cat = new S3FileScanCat(false, scannerOptions({ partitionStack: ['year'] }), testAwsSecrets)
+
+        await expect(cat.scanAndProcessFiles('bucket', 'data/src', 'data/dst')).rejects.toThrow(
+            'transient list failure'
+        )
+
+        // After the failure, state is stale. Without the reset, `isDone` would still be false
+        // *and* the next run would inherit leftover `_keyParams`/`_allPrefixes` pushes.
+        expect(cat.isDone).toBe(false)
+
+        await cat.scanAndProcessFiles('bucket', 'data/src', 'data/dst')
+
+        expect(cat.isDone).toBe(true)
+        expect(cat.prefixesProcessedTotal).toBe(1)
+        expect(cat.totalPrefixesToProcess).toBe(1)
+        expect(cat.s3ObjectsPutTotal).toBe(1)
+    })
+
+    it('rejects concurrent scanAndProcessFiles calls on the same instance', async () => {
+        stubPartitionAndConcatList(() => ({
+            Contents: [{ Key: 'data/src/year=2020/a.json', Size: 8 }],
+            IsTruncated: false,
+        }))
+        let releaseGet: (() => void) | undefined
+        s3Mock.on(GetObjectCommand).callsFake(
+            () =>
+                new Promise((resolve) => {
+                    releaseGet = () =>
+                        resolve({ Body: sdkStreamMixin(Readable.from(['{"x":1}'])) })
+                })
+        )
+        s3Mock.on(PutObjectCommand).resolves({})
+
+        const cat = new S3FileScanCat(false, scannerOptions({ partitionStack: ['year'] }), testAwsSecrets)
+
+        const first = cat.scanAndProcessFiles('bucket', 'data/src', 'data/dst')
+        // Give the first call a chance to set `_isRunning` and reach the in-flight body stage.
+        await new Promise((resolve) => setTimeout(resolve, 20))
+
+        await expect(cat.scanAndProcessFiles('bucket', 'data/src', 'data/dst')).rejects.toThrow(
+            /already running/
+        )
+
+        // Let the first run finish and verify it still succeeds.
+        releaseGet?.()
+        await first
+        expect(cat.isDone).toBe(true)
+    })
 })
