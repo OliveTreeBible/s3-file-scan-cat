@@ -54,7 +54,21 @@ export class S3FileScanCat {
     private _scannerOptions: ScannerOptions
     private _awsAccess: AWSSecrets
     private _s3Client: S3Client
-    constructor(useAccelerateEndpoint: boolean, scannerOptions: ScannerOptions, awsAccess: AWSSecrets) {
+    /**
+     * @param useAccelerateEndpoint Whether to use the S3 Transfer Acceleration endpoint.
+     * @param scannerOptions Scanner configuration (partition stack, bounds, limits, logging).
+     * @param awsAccess AWS credentials used to construct the S3 client.
+     * @param region AWS region for the S3 client. Defaults to `'us-east-1'` for backward
+     *   compatibility with earlier versions that hard-coded the region. Callers working with
+     *   buckets in other regions should pass the bucket's actual region to avoid cross-region
+     *   redirect latency (or outright failures on strict endpoints).
+     */
+    constructor(
+        useAccelerateEndpoint: boolean,
+        scannerOptions: ScannerOptions,
+        awsAccess: AWSSecrets,
+        region: string = 'us-east-1'
+    ) {
         if (scannerOptions.loggerOptions !== undefined) {
             this._logger = createLogger({
                 ...scannerOptions.loggerOptions,
@@ -72,7 +86,7 @@ export class S3FileScanCat {
         this._scannerOptions = scannerOptions
         this._awsAccess = awsAccess
         this._s3Client = new S3Client({
-            region: 'us-east-1',
+            region,
             credentials: {
                 accessKeyId: this._awsAccess.accessKeyId,
                 secretAccessKey: this._awsAccess.secretAccessKey,

@@ -154,6 +154,26 @@ describe('S3FileScanCat edges (mocked S3)', () => {
         expect(bodies).toEqual(['{"a":1}\n', '{"b":2}\n'])
     })
 
+    it("defaults the S3 client region to 'us-east-1' for backward compatibility", async () => {
+        const cat = new S3FileScanCat(false, scannerOptions({ partitionStack: ['year'] }), testAwsSecrets)
+        const client = (cat as unknown as { _s3Client: S3Client })._s3Client
+        // AWS SDK v3 exposes region as a provider function returning a Promise<string>.
+        const resolvedRegion = await client.config.region()
+        expect(resolvedRegion).toBe('us-east-1')
+    })
+
+    it('uses the region argument when one is provided to the constructor', async () => {
+        const cat = new S3FileScanCat(
+            false,
+            scannerOptions({ partitionStack: ['year'] }),
+            testAwsSecrets,
+            'eu-west-2'
+        )
+        const client = (cat as unknown as { _s3Client: S3Client })._s3Client
+        const resolvedRegion = await client.config.region()
+        expect(resolvedRegion).toBe('eu-west-2')
+    })
+
     it('fails fast without retrying on a non-retryable 4xx S3 error (_isRetryableError)', async () => {
         stubPartitionAndConcatList(() => ({
             Contents: [{ Key: 'data/src/year=2020/forbidden.json', Size: 8 }],
