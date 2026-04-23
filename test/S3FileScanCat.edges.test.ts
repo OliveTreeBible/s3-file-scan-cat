@@ -154,6 +154,38 @@ describe('S3FileScanCat edges (mocked S3)', () => {
         expect(bodies).toEqual(['{"a":1}\n', '{"b":2}\n'])
     })
 
+    it('close() destroys the S3 client and keep-alive agents, and rejects further scans', async () => {
+        const cat = new S3FileScanCat(false, scannerOptions({ partitionStack: ['year'] }), testAwsSecrets)
+
+        const internals = cat as unknown as {
+            _s3Client: { destroy: () => void }
+            _httpsAgent: { destroy: () => void }
+            _httpAgent: { destroy: () => void }
+        }
+        const clientDestroy = vi.spyOn(internals._s3Client, 'destroy')
+        const httpsDestroy = vi.spyOn(internals._httpsAgent, 'destroy')
+        const httpDestroy = vi.spyOn(internals._httpAgent, 'destroy')
+
+        expect(cat.isClosed).toBe(false)
+        cat.close()
+        expect(cat.isClosed).toBe(true)
+        expect(clientDestroy).toHaveBeenCalledTimes(1)
+        expect(httpsDestroy).toHaveBeenCalledTimes(1)
+        expect(httpDestroy).toHaveBeenCalledTimes(1)
+
+        // Calling close() again is a no-op (idempotent), no extra destroys.
+        cat.close()
+        expect(clientDestroy).toHaveBeenCalledTimes(1)
+        expect(httpsDestroy).toHaveBeenCalledTimes(1)
+        expect(httpDestroy).toHaveBeenCalledTimes(1)
+
+        // Further scans must reject loudly rather than silently issuing S3 traffic against a
+        // torn-down client.
+        await expect(cat.scanAndProcessFiles('bucket', 'data/src', 'data/dst')).rejects.toThrow(
+            /called after close\(\)/
+        )
+    })
+
     it("defaults the S3 client region to 'us-east-1' for backward compatibility", async () => {
         const cat = new S3FileScanCat(false, scannerOptions({ partitionStack: ['year'] }), testAwsSecrets)
         const client = (cat as unknown as { _s3Client: S3Client })._s3Client

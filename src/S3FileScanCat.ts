@@ -49,11 +49,20 @@ export class S3FileScanCat {
     private _inFlightPartitionScans: Set<Promise<void>> = new Set()
     /** Guards against concurrent/re-entrant calls to `scanAndProcessFiles`. */
     private _isRunning: boolean = false
+    /** Once true, every future `scanAndProcessFiles` call rejects instead of issuing S3 traffic. */
+    private _isClosed: boolean = false
     private _s3ObjectBodyProcessInProgressLimit: number
     private _maxFileSizeBytes: number
     private _scannerOptions: ScannerOptions
     private _awsAccess: AWSSecrets
     private _s3Client: S3Client
+    /**
+     * Held on the instance so `close()` can tear down the keep-alive socket pools. Without this,
+     * Node's event loop would stay alive after a caller's work is done because the agents keep
+     * their pooled TCP connections open.
+     */
+    private _httpsAgent: HttpsAgent
+    private _httpAgent: HttpAgent
     /**
      * @param useAccelerateEndpoint Whether to use the S3 Transfer Acceleration endpoint.
      * @param scannerOptions Scanner configuration (partition stack, bounds, limits, logging).
@@ -85,6 +94,18 @@ export class S3FileScanCat {
                 : 128 * 1024 * 1024
         this._scannerOptions = scannerOptions
         this._awsAccess = awsAccess
+        // Build the keep-alive agents as named references so `close()` can destroy them later.
+        // keepAlive is a default from AWS SDK; we preserve it for performance.
+        this._httpsAgent = new HttpsAgent({
+            maxSockets: 500,
+            keepAlive: true,
+            keepAliveMsecs: 1000,
+        })
+        this._httpAgent = new HttpAgent({
+            maxSockets: 500,
+            keepAlive: true,
+            keepAliveMsecs: 1000,
+        })
         this._s3Client = new S3Client({
             region,
             credentials: {
@@ -95,25 +116,55 @@ export class S3FileScanCat {
             // Use a custom request handler so that we can adjust the HTTPS Agent and
             // socket behavior.
             requestHandler: new NodeHttpHandler({
-                httpsAgent: new HttpsAgent({
-                    maxSockets: 500,
-
-                    // keepAlive is a default from AWS SDK. We want to preserve this for
-                    // performance reasons.
-                    keepAlive: true,
-                    keepAliveMsecs: 1000,
-                }),
-                httpAgent: new HttpAgent({
-                    maxSockets: 500,
-
-                    // keepAlive is a default from AWS SDK. We want to preserve this for
-                    // performance reasons.
-                    keepAlive: true,
-                    keepAliveMsecs: 1000,
-                }),
+                httpsAgent: this._httpsAgent,
+                httpAgent: this._httpAgent,
                 socketTimeout: 5000,
             }),
         })
+    }
+
+    /**
+     * Release the underlying S3 client and keep-alive socket pools. Once called, further
+     * `scanAndProcessFiles` invocations reject.
+     *
+     * Node will not exit cleanly while this instance's HTTP(S) agents are holding pooled
+     * sockets (because `keepAlive: true` pins them until their idle timer fires). Always call
+     * `close()` when the caller is done using the scanner.
+     *
+     * Idempotent: safe to call multiple times. Does not wait for in-flight operations; the
+     * caller should `await` any outstanding `scanAndProcessFiles` promises first.
+     */
+    close(): void {
+        if (this._isClosed) {
+            return
+        }
+        this._isClosed = true
+        try {
+            this._s3Client.destroy()
+        } catch (err) {
+            void this._logger?.warn(
+                `S3Client.destroy threw while closing S3FileScanCat: ${err instanceof Error ? err.message : String(err)}`
+            )
+        }
+        try {
+            this._httpsAgent.destroy()
+        } catch (err) {
+            void this._logger?.warn(
+                `https agent destroy threw while closing S3FileScanCat: ${err instanceof Error ? err.message : String(err)}`
+            )
+        }
+        try {
+            this._httpAgent.destroy()
+        } catch (err) {
+            void this._logger?.warn(
+                `http agent destroy threw while closing S3FileScanCat: ${err instanceof Error ? err.message : String(err)}`
+            )
+        }
+    }
+
+    /** Returns true if `close()` has been called on this instance. */
+    get isClosed(): boolean {
+        return this._isClosed
     }
 
     get s3BuildPrefixListObjectsProcessCount(): number {
@@ -157,6 +208,11 @@ export class S3FileScanCat {
     }
 
     async scanAndProcessFiles(bucket: string, srcPrefix: string, destPrefix: string): Promise<void> {
+        if (this._isClosed) {
+            throw new Error(
+                'S3FileScanCat.scanAndProcessFiles called after close(); construct a new S3FileScanCat.'
+            )
+        }
         if (this._isRunning) {
             throw new Error(
                 'scanAndProcessFiles is already running on this instance; await the existing call or construct a new S3FileScanCat.'
