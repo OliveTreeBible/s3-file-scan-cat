@@ -1,9 +1,12 @@
 {
   "name": "s3-file-scan-cat",
-  "version": "1.3.0",
+  "version": "2.0.0",
   "description": "A utility to recursively scan a specified folder in S3 and concat JSON files within a single folder into a single gzip file.",
   "main": "lib/index.js",
   "types": "lib/index.d.ts",
+  "engines": {
+    "node": ">=20"
+  },
   "repository": {
     "type": "git",
     "url": "https://github.com/OliveTreeBible/s3-file-scan-cat.git"
@@ -12,7 +15,7 @@
     "test": "echo \"Error: no test specified\" && exit 1",
     "build": "tsc",
     "format": "prettier --write \"src/**/*.ts\"",
-    "lint": "tslint -p tsconfig.json",
+    "lint": "eslint \"src/**/*.ts\"",
     "prepare": "npm run build",
     "prepublishOnly": "npm run lint",
     "preversion": "npm run lint",
@@ -26,19 +29,19 @@
   "author": "David Trotz",
   "license": "",
   "dependencies": {
-    "@aws-sdk/client-s3": "^3.741.0",
-    "@smithy/node-http-handler": "^4.0.2",
-    "@types/node": "^22.13.0",
-    "@types/node-os-utils": "^1.3.4",
-    "async-wait-until": "^2.0.22",
-    "moment": "^2.30.1",
-    "node-os-utils": "^1.3.7",
-    "ot-logger-deluxe": "^1.1.1"
+    "@aws-sdk/client-s3": "^3.1036.0",
+    "@smithy/node-http-handler": "^4.6.1",
+    "ot-logger-deluxe": "^2.0.2"
   },
   "devDependencies": {
-    "prettier": "^3.4.2",
-    "tslint": "^6.1.3",
-    "tslint-config-prettier": "^1.18.0",
-    "typescript": "^5.7.3"
+    "@eslint/js": "^10.0.1",
+    "@types/node": "^25.6.0",
+    "@typescript-eslint/eslint-plugin": "^8.59.0",
+    "@typescript-eslint/parser": "^8.59.0",
+    "eslint": "^10.2.1",
+    "eslint-config-prettier": "^10.1.8",
+    "prettier": "^3.8.3",
+    "typescript": "^6.0.3",
+    "typescript-eslint": "^8.59.0"
   }
 }

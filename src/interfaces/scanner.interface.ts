@@ -1,4 +1,7 @@
-import { OTLoggerDeluxeOptions } from 'ot-logger-deluxe'
+import type { LoggerOptions } from 'ot-logger-deluxe'
+
+/** Options passed to ot-logger-deluxe; `name` is always set to `file-scan-cat` by the scanner. */
+export type ScannerLoggerOptions = Omit<LoggerOptions, 'name'>
 
 export interface ScannerConfig {
     aws: AWSConfig
@@ -11,7 +14,7 @@ export interface ScannerBounds {
 }
 
 export interface ScannerOptions {
-    logOptions?: OTLoggerDeluxeOptions
+    loggerOptions?: ScannerLoggerOptions
     partitionStack: string[]
     bounds?: ScannerBounds
     limits: ScannerLimits

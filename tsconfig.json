@@ -3,23 +3,19 @@
   "compilerOptions": {
     "noImplicitAny": true,
     "strictNullChecks": true,
-    "moduleResolution": "node",
+    "moduleResolution": "node16",
     "declaration": true,
     "strict": true,
-    "lib": ["ES2019"],
-    "module": "commonjs",
-    "target": "ES2019",
+    "lib": ["ES2022"],
+    "module": "node16",
+    "target": "ES2022",
+    "rootDir": "./src",
     "outDir": "./lib",
     "sourceMap": true,
-    "typeRoots": [
-      "node_modules/@types"
-    ],
-    "types": [
-      "node"
-    ]
+    "esModuleInterop": true,
+    "typeRoots": ["node_modules/@types"],
+    "types": ["node"]
   },
-  "include": [
-    "src/**/*"
-  ],
+  "include": ["src/**/*"],
   "exclude": ["node_modules", "**/__tests__/*"]
 }
