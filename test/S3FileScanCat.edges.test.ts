@@ -154,6 +154,77 @@ describe('S3FileScanCat edges (mocked S3)', () => {
         expect(bodies).toEqual(['{"a":1}\n', '{"b":2}\n'])
     })
 
+    it('runs mid-stream flushes concurrently without holding the buffer mutex across gzip+put', async () => {
+        // Three 10-byte bodies under a 15-byte cap -> two mid-stream flushes (buffers 0 and 1)
+        // followed by a final flush (buffer 2). Under the old behavior the buffer mutex was
+        // held across each flush, so only ONE put could be pending at a time. With the fix the
+        // mid-stream flushes are detached, so puts 0 and 1 overlap in flight.
+        stubPartitionAndConcatList(() => ({
+            Contents: [
+                { Key: 'data/src/year=2020/a.json', Size: 10 },
+                { Key: 'data/src/year=2020/b.json', Size: 10 },
+                { Key: 'data/src/year=2020/c.json', Size: 10 },
+            ],
+            IsTruncated: false,
+        }))
+        s3Mock.on(GetObjectCommand).callsFake((input) => {
+            const payload = input.Key?.endsWith('a.json')
+                ? 'AAAAAAAAAA'
+                : input.Key?.endsWith('b.json')
+                  ? 'BBBBBBBBBB'
+                  : 'CCCCCCCCCC'
+            return Promise.resolve({ Body: sdkStreamMixin(Readable.from([payload])) })
+        })
+
+        const putResolvers: Array<() => void> = []
+        let maxConcurrentPuts = 0
+        let currentConcurrentPuts = 0
+        s3Mock.on(PutObjectCommand).callsFake(
+            () =>
+                new Promise<object>((resolve) => {
+                    currentConcurrentPuts++
+                    maxConcurrentPuts = Math.max(maxConcurrentPuts, currentConcurrentPuts)
+                    putResolvers.push(() => {
+                        currentConcurrentPuts--
+                        resolve({})
+                    })
+                })
+        )
+
+        const cat = new S3FileScanCat(
+            false,
+            scannerOptions({
+                partitionStack: ['year'],
+                limits: { maxFileSizeBytes: 15 },
+            }),
+            testAwsSecrets
+        )
+
+        const runPromise = cat.scanAndProcessFiles('bucket', 'data/src', 'data/dst')
+
+        // Wait for both mid-stream flushes to be in flight simultaneously. Under the fix the
+        // append-phase mutex does not block on the flush, so put 0 can still be pending when
+        // put 1 is initiated. Under the old code only one put is ever pending at a time.
+        for (let i = 0; i < 50 && maxConcurrentPuts < 2; i++) {
+            await new Promise((r) => setTimeout(r, 5))
+        }
+        expect(maxConcurrentPuts).toBeGreaterThanOrEqual(2)
+
+        // Now let the scan finish by draining any put (including the final flush) as it arrives.
+        const drain = setInterval(() => {
+            while (putResolvers.length > 0) {
+                putResolvers.shift()!()
+            }
+        }, 5)
+        try {
+            await runPromise
+        } finally {
+            clearInterval(drain)
+        }
+        // Three buffers total: two mid-stream flushes + one final flush.
+        expect(cat.s3ObjectsPutTotal).toBe(3)
+    })
+
     it('_buildDestinationKey handles trailing-slash variants, mismatched paths, and deep leaves', () => {
         const cat = new S3FileScanCat(false, scannerOptions({ partitionStack: ['year'] }), testAwsSecrets)
 
@@ -449,6 +520,7 @@ describe('S3FileScanCat edges (mocked S3)', () => {
             nextSeqToAppend: 0,
             pendingBodies: new Map(),
             bodiesInFlight: 0,
+            inFlightFlushes: new Set(),
         }
         await expect(
             cat._getAndProcessObjectBody(
@@ -474,6 +546,7 @@ describe('S3FileScanCat edges (mocked S3)', () => {
             nextSeqToAppend: 0,
             pendingBodies: new Map(),
             bodiesInFlight: 0,
+            inFlightFlushes: new Set(),
         }
         await expect(
             cat._getAndProcessObjectBody(

@@ -70,6 +70,14 @@ export interface ConcatState {
      * `_s3ObjectBodyProcessInProgress` counter is retained as a rollup for observability only.
      */
     bodiesInFlight: number
+    /**
+     * Detached flush promises spawned by workers outside the buffer mutex. Holding the mutex
+     * across `gzip` + `PutObject` previously blocked every other worker for the entire flush
+     * round trip. Workers now snapshot the buffer under the mutex, release it, and let the
+     * flush run asynchronously; `concatFilesAtPrefix` awaits this set via `Promise.allSettled`
+     * before returning so callers never see output still in flight after the scan resolves.
+     */
+    inFlightFlushes: Set<Promise<void>>
 }
 
 export interface PrefixEvalResult {

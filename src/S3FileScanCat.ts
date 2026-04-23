@@ -367,6 +367,7 @@ export class S3FileScanCat {
             nextSeqToAppend: 0,
             pendingBodies: new Map(),
             bodiesInFlight: 0,
+            inFlightFlushes: new Set(),
         }
 
         // Monotonic listing-order sequence number assigned to each fetchable key.
@@ -495,6 +496,12 @@ export class S3FileScanCat {
             // mutate `concatState` or the shared counters after this method resolves.
             if (inFlightBodies.size > 0) {
                 await Promise.allSettled([...inFlightBodies])
+            }
+            // Bodies have settled but may have spawned detached flushes (gzip + PutObject)
+            // that are still running. Drain those too, otherwise callers could see puts
+            // land in S3 after concatFilesAtPrefix has already resolved.
+            if (concatState.inFlightFlushes.size > 0) {
+                await Promise.allSettled([...concatState.inFlightFlushes])
             }
         }
         if (this._fatalScanError) {
@@ -639,15 +646,33 @@ export class S3FileScanCat {
                         concatState.buffer &&
                         concatState.buffer.length + addSize > this._maxFileSizeBytes
                     ) {
-                        await this._flushBuffer(
+                        // Detach the flush so the buffer mutex is not held across gzip+PutObject.
+                        // Under the mutex we only snapshot the buffer and increment fileNumber;
+                        // the expensive async work runs outside the critical section so other
+                        // body workers are not blocked for the duration of the round trip.
+                        // The resulting promise is tracked on `concatState.inFlightFlushes` and
+                        // awaited in concatFilesAtPrefix's finally block.
+                        const bufferToFlush = concatState.buffer
+                        const flushFileNumber = concatState.fileNumber++
+                        concatState.buffer = undefined
+                        const flushPromise: Promise<void> = this._flushBuffer(
                             bucket,
-                            concatState.buffer,
+                            bufferToFlush,
                             prefix,
                             srcPrefix,
                             destPrefix,
-                            concatState.fileNumber++
+                            flushFileNumber
                         )
-                        concatState.buffer = undefined
+                            .catch((err: unknown) => {
+                                void this._logger?.error(
+                                    `Flush failed for prefix=${prefix} fileNumber=${flushFileNumber}: ${err instanceof Error ? err.message : String(err)}`
+                                )
+                                this._setFatalScanError(err)
+                            })
+                            .finally(() => {
+                                concatState.inFlightFlushes.delete(flushPromise)
+                            })
+                        concatState.inFlightFlushes.add(flushPromise)
                     }
                     concatState.buffer = (concatState.buffer ?? '') + bodyWithNl
                 }
