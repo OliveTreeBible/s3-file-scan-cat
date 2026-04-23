@@ -1,7 +1,12 @@
 import { Agent as HttpAgent } from 'node:http'
 import { Agent as HttpsAgent } from 'node:https'
+import { promisify } from 'node:util'
 import { createLogger, Logger } from 'ot-logger-deluxe'
 import * as zlib from 'zlib'
+
+// Async gzip so that compressing large buffers doesn't block the event loop; libuv
+// runs the work on its thread pool instead of stalling every other S3 request in flight.
+const gzipAsync = promisify(zlib.gzip)
 
 import {
     CommonPrefix, GetObjectCommand, GetObjectCommandOutput, ListObjectsV2Command,
@@ -601,10 +606,10 @@ export class S3FileScanCat {
         void this._logger?.trace(`BEGIN _saveToS3 key=${key} - _s3ObjectPutProcessCount: ${this._s3ObjectPutProcessCount}`)
 
         // Wrap the entire "in-flight" lifecycle in try/finally so `_s3ObjectPutProcessCount`
-        // cannot leak if gzipSync throws or PutObject rejects.
+        // cannot leak if gzip throws or PutObject rejects.
         this._s3ObjectPutProcessCount++
         try {
-            const body = zlib.gzipSync(buffer)
+            const body = await gzipAsync(buffer)
             const object: PutObjectCommandInput = {
                 Body: body,
                 Bucket: bucket,
