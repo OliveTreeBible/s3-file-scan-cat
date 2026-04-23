@@ -1,28 +1,18 @@
 import { Agent as HttpAgent } from 'node:http'
 import { Agent as HttpsAgent } from 'node:https'
+import { createLogger, Logger } from 'ot-logger-deluxe'
 import * as zlib from 'zlib'
 
 import {
-    CommonPrefix,
-    GetObjectCommand,
-    GetObjectCommandOutput,
-    ListObjectsV2Command,
-    ListObjectsV2CommandInput,
-    ListObjectsV2CommandOutput,
-    PutObjectCommand,
-    PutObjectCommandInput,
-    S3Client,
+    CommonPrefix, GetObjectCommand, GetObjectCommandOutput, ListObjectsV2Command,
+    ListObjectsV2CommandInput, ListObjectsV2CommandOutput, PutObjectCommand, PutObjectCommandInput,
+    S3Client
 } from '@aws-sdk/client-s3'
 import { NodeHttpHandler } from '@smithy/node-http-handler'
-import { createLogger, type Logger } from 'ot-logger-deluxe'
 
 import { EmptyPrefixError } from './errors/EmptyPrefixError'
 import {
-    AWSSecrets,
-    ConcatState,
-    PrefixEvalResult,
-    PrefixParams,
-    ScannerOptions,
+    AWSSecrets, ConcatState, PrefixEvalResult, PrefixParams, ScannerOptions
 } from './interfaces/scanner.interface'
 import { formatUtcYmdParts, utcDayStartMs } from './utcDayRange'
 import { waitUntil } from './waitUntil'
@@ -45,6 +35,8 @@ export class S3FileScanCat {
     private _s3ObjectsFetchedTotal: number
     private _s3ObjectsPutTotal: number
     private _isDone: boolean
+    /** Set on first background failure so wait loops can exit and the scan rejects cleanly. */
+    private _fatalScanError: Error | undefined
     private _s3ObjectBodyProcessInProgressLimit: number
     private _maxFileSizeBytes: number
     private _scannerOptions: ScannerOptions
@@ -53,8 +45,8 @@ export class S3FileScanCat {
     constructor(useAccelerateEndpoint: boolean, scannerOptions: ScannerOptions, awsAccess: AWSSecrets) {
         if (scannerOptions.loggerOptions !== undefined) {
             this._logger = createLogger({
-                name: 'file-scan-cat',
                 ...scannerOptions.loggerOptions,
+                name: 'file-scan-cat',
             })
         }
         this._delimeter = '/'
@@ -69,6 +61,7 @@ export class S3FileScanCat {
         this._s3ObjectsFetchedTotal = 0
         this._s3ObjectsPutTotal = 0
         this._isDone = false
+        this._fatalScanError = undefined
         this._s3ObjectBodyProcessInProgressLimit =
             scannerOptions.limits?.s3ObjectBodyProcessInProgressLimit !== undefined
                 ? scannerOptions.limits?.s3ObjectBodyProcessInProgressLimit
@@ -151,6 +144,7 @@ export class S3FileScanCat {
     }
 
     async scanAndProcessFiles(bucket: string, srcPrefix: string, destPrefix: string): Promise<void> {
+        this._fatalScanError = undefined
         void this._logger?.trace(
             `BEGIN scanConcatenateCopy srcPrefix=${srcPrefix}:destPrefix=${destPrefix}:partitionStack=${this._scannerOptions.partitionStack}`
         )
@@ -181,6 +175,9 @@ export class S3FileScanCat {
         let waits = 0
         while (this._keyParams.length > 0 || this._scanPrefixForPartitionsProcessCount > 0) {
             await waitUntil(() => {
+                if (this._fatalScanError) {
+                    return true
+                }
                 if (
                     this._scanPrefixForPartitionsProcessCount === 0 ||
                     (this._keyParams.length > 0 &&
@@ -192,8 +189,18 @@ export class S3FileScanCat {
                     void this._logger?.debug(`Waiting on ListObjects to complete prefix=${srcPrefix} `)
                 }
             })
+            if (this._fatalScanError) {
+                throw this._fatalScanError
+            }
             const keyParam = this._keyParams.shift()
-            if (keyParam) this._scanPrefixForPartitions(keyParam)
+            if (keyParam) {
+                void this._scanPrefixForPartitions(keyParam).catch((err: unknown) => {
+                    void this._logger?.error(
+                        `Partition scan failed for prefix=${keyParam.curPrefix}: ${err instanceof Error ? err.message : String(err)}`
+                    )
+                    this._setFatalScanError(err)
+                })
+            }
         }
         this._prefixesProcessedTotal = 0
         this._totalPrefixesToProcess = this._allPrefixes.length
@@ -258,14 +265,32 @@ export class S3FileScanCat {
                 for (const s3Object of response.Contents) {
                     if (s3Object.Size && s3Object.Key) {
                         await waitUntil(() => {
+                            if (this._fatalScanError) {
+                                return true
+                            }
                             if (this._s3ObjectBodyProcessInProgress < this._s3ObjectBodyProcessInProgressLimit) {
                                 return true
                             } else if (waits++ % 20 === 0) {
                                 void this._logger?.trace(`Waiting on ListObjects to complete prefix=${srcPrefix} `)
                             }
                         })
+                        if (this._fatalScanError) {
+                            throw this._fatalScanError
+                        }
                         // We purposely do not await on this - the waitUntil above limits the number of these calls that are in progress at any given moment.
-                        this._getAndProcessObjectBody(bucket, s3Object.Key, concatState, prefix, srcPrefix, destPrefix)
+                        void this._getAndProcessObjectBody(
+                            bucket,
+                            s3Object.Key,
+                            concatState,
+                            prefix,
+                            srcPrefix,
+                            destPrefix
+                        ).catch((err: unknown) => {
+                            void this._logger?.error(
+                                `getObject/process failed for key=${s3Object.Key}: ${err instanceof Error ? err.message : String(err)}`
+                            )
+                            this._setFatalScanError(err)
+                        })
                     } else if (s3Object.Size === 0) {
                         void this._logger?.warn(`S3 Object had zero size ${JSON.stringify(s3Object.Key)}`)
                     } else {
@@ -282,6 +307,9 @@ export class S3FileScanCat {
         } while (concatState.continuationToken)
         // Finally wait until all the objects have been fetched and processed
         await waitUntil(() => {
+            if (this._fatalScanError) {
+                return true
+            }
             if (this._s3ObjectBodyProcessInProgress === 0) {
                 return true
             } else if (waits++ % 20 === 0) {
@@ -290,6 +318,9 @@ export class S3FileScanCat {
                 )
             }
         })
+        if (this._fatalScanError) {
+            throw this._fatalScanError
+        }
         // Now do a final flush
         if (!concatState.continuationToken && concatState.buffer && concatState.buffer.length > 0) {
             this._flushBuffer(
@@ -390,6 +421,13 @@ export class S3FileScanCat {
         }
     }
 
+    _setFatalScanError(err: unknown): void {
+        if (this._fatalScanError !== undefined) {
+            return
+        }
+        this._fatalScanError = err instanceof Error ? err : new Error(String(err))
+    }
+
     _sleep(milliseconds: number): Promise<void> {
         return new Promise((resolve) => {
             setTimeout(resolve, milliseconds)
@@ -442,52 +480,55 @@ export class S3FileScanCat {
 
     async _scanPrefixForPartitions(keyParams: PrefixParams): Promise<void> {
         this._scanPrefixForPartitionsProcessCount++
-        void this._logger?.trace(`_scanPrefixForPartitions ${keyParams.curPrefix}::${keyParams.partitionStack}`)
-        const curPart = keyParams.partitionStack.shift()
-        if (!curPart) {
-            throw new Error('Unexpected end of partition stack!')
-        }
-
-        if (!keyParams.curPrefix.endsWith(this._delimeter)) {
-            keyParams.curPrefix += this._delimeter
-        }
-
-        const listObjRequest: ListObjectsV2CommandInput = {
-            Bucket: keyParams.bucket,
-            Prefix: keyParams.curPrefix,
-            Delimiter: this._delimeter,
-        }
-        let continuationToken: undefined | string
-        do {
-            listObjRequest.ContinuationToken = continuationToken
-            let response: ListObjectsV2CommandOutput
-            try {
-                response = await this._s3Client.send(new ListObjectsV2Command(listObjRequest))
-            } catch (e) {
-                void this._logger?.error(`Failed to list objects at prefix ${keyParams.curPrefix}`)
-                throw e
+        try {
+            void this._logger?.trace(`_scanPrefixForPartitions ${keyParams.curPrefix}::${keyParams.partitionStack}`)
+            const curPart = keyParams.partitionStack.shift()
+            if (!curPart) {
+                throw new Error('Unexpected end of partition stack!')
             }
-            if (response.CommonPrefixes && response.CommonPrefixes.length > 0) {
-                if (response.IsTruncated && response.NextContinuationToken) {
-                    continuationToken = response.NextContinuationToken
-                } else {
-                    continuationToken = undefined
+
+            if (!keyParams.curPrefix.endsWith(this._delimeter)) {
+                keyParams.curPrefix += this._delimeter
+            }
+
+            const listObjRequest: ListObjectsV2CommandInput = {
+                Bucket: keyParams.bucket,
+                Prefix: keyParams.curPrefix,
+                Delimiter: this._delimeter,
+            }
+            let continuationToken: undefined | string
+            do {
+                listObjRequest.ContinuationToken = continuationToken
+                let response: ListObjectsV2CommandOutput
+                try {
+                    response = await this._s3Client.send(new ListObjectsV2Command(listObjRequest))
+                } catch (e) {
+                    void this._logger?.error(`Failed to list objects at prefix ${keyParams.curPrefix}`)
+                    throw e
                 }
-                response.CommonPrefixes.forEach((commonPrefix) => {
-                    const prefixEval = this._evaluatePrefix(keyParams, commonPrefix, curPart)
-                    if (prefixEval.partition) {
-                        this._allPrefixes.push(prefixEval.partition)
-                    } else if (prefixEval.keyParams) {
-                        this._keyParams.push(prefixEval.keyParams)
+                if (response.CommonPrefixes && response.CommonPrefixes.length > 0) {
+                    if (response.IsTruncated && response.NextContinuationToken) {
+                        continuationToken = response.NextContinuationToken
                     } else {
-                        throw new Error(`Unexpected partition info encountered. ${JSON.stringify(keyParams)}`)
+                        continuationToken = undefined
                     }
-                })
-            } else {
-                throw new Error(`Unexpected empty response from S3. ${JSON.stringify(keyParams)}`)
-            }
-        } while (continuationToken)
-        this._scanPrefixForPartitionsProcessCount--
+                    response.CommonPrefixes.forEach((commonPrefix) => {
+                        const prefixEval = this._evaluatePrefix(keyParams, commonPrefix, curPart)
+                        if (prefixEval.partition) {
+                            this._allPrefixes.push(prefixEval.partition)
+                        } else if (prefixEval.keyParams) {
+                            this._keyParams.push(prefixEval.keyParams)
+                        } else {
+                            throw new Error(`Unexpected partition info encountered. ${JSON.stringify(keyParams)}`)
+                        }
+                    })
+                } else {
+                    throw new Error(`Unexpected empty response from S3. ${JSON.stringify(keyParams)}`)
+                }
+            } while (continuationToken)
+        } finally {
+            this._scanPrefixForPartitionsProcessCount--
+        }
     }
 
     _evaluatePrefix(keyParams: PrefixParams, commonPrefix: CommonPrefix, curPart: string): PrefixEvalResult {
