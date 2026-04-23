@@ -761,9 +761,50 @@ export class S3FileScanCat {
         fileNumber: number
     ): Promise<void> {
         void this._logger?.trace(`BEGIN _flushBuffer destination=${destPrefix}`)
-        const fileName = `${prefix.replace(srcPrefix, destPrefix)}/${fileNumber}.json.gz`
+        const fileName = this._buildDestinationKey(prefix, srcPrefix, destPrefix, fileNumber)
         await this._saveToS3(bucket, buffer, fileName)
         void this._logger?.trace(`END _flushBuffer destination=${destPrefix}`)
+    }
+
+    /**
+     * Build the destination S3 key for a flushed part, translating a leaf `prefix` from
+     * under `srcPrefix` to the corresponding location under `destPrefix`.
+     *
+     * Path-aware: validates that `prefix` really is a path-descendant of `srcPrefix`
+     * (so e.g. `srcPrefix='data/src'` does not silently match `'data/source/...'`), and
+     * normalizes trailing slashes on all three inputs. Throws with a clear error on any
+     * mismatch so misconfiguration surfaces instead of writing under the wrong key.
+     */
+    _buildDestinationKey(
+        prefix: string,
+        srcPrefix: string,
+        destPrefix: string,
+        fileNumber: number
+    ): string {
+        // Strip trailing slashes so we can work with canonical path-segment comparisons.
+        const src = srcPrefix.replace(/\/+$/, '')
+        const dst = destPrefix.replace(/\/+$/, '')
+        const leaf = prefix.replace(/\/+$/, '')
+
+        let relative: string
+        if (src === '') {
+            // Empty srcPrefix: treat the whole leaf as the relative path.
+            relative = leaf
+        } else if (leaf === src) {
+            relative = ''
+        } else if (leaf.startsWith(`${src}/`)) {
+            relative = leaf.slice(src.length + 1)
+        } else {
+            throw new Error(
+                `Leaf prefix '${prefix}' is not a path-descendant of srcPrefix '${srcPrefix}'; cannot build destination key.`
+            )
+        }
+
+        // Build ${dst}/[relative/]${fileNumber}.json.gz without introducing empty path segments.
+        const destStem = dst === '' ? '' : `${dst}/`
+        return relative.length > 0
+            ? `${destStem}${relative}/${fileNumber}.json.gz`
+            : `${destStem}${fileNumber}.json.gz`
     }
 
     async _saveToS3(bucket: string, buffer: string, key: string): Promise<void> {

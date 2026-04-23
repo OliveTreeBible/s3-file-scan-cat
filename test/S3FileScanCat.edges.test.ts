@@ -154,6 +154,48 @@ describe('S3FileScanCat edges (mocked S3)', () => {
         expect(bodies).toEqual(['{"a":1}\n', '{"b":2}\n'])
     })
 
+    it('_buildDestinationKey handles trailing-slash variants, mismatched paths, and deep leaves', () => {
+        const cat = new S3FileScanCat(false, scannerOptions({ partitionStack: ['year'] }), testAwsSecrets)
+
+        // Canonical happy path.
+        expect(cat._buildDestinationKey('data/src/year=2020', 'data/src', 'data/dst', 0)).toBe(
+            'data/dst/year=2020/0.json.gz'
+        )
+
+        // Trailing slashes on any/all of the inputs should normalize cleanly.
+        expect(cat._buildDestinationKey('data/src/year=2020/', 'data/src/', 'data/dst/', 1)).toBe(
+            'data/dst/year=2020/1.json.gz'
+        )
+        expect(cat._buildDestinationKey('data/src/year=2020', 'data/src/', 'data/dst', 2)).toBe(
+            'data/dst/year=2020/2.json.gz'
+        )
+
+        // Deep leaves work end-to-end.
+        expect(
+            cat._buildDestinationKey(
+                'data/src/year=2020/month=01/day=01',
+                'data/src',
+                'data/dst',
+                7
+            )
+        ).toBe('data/dst/year=2020/month=01/day=01/7.json.gz')
+
+        // Leaf equal to srcPrefix (edge case) -> no empty segment.
+        expect(cat._buildDestinationKey('data/src', 'data/src', 'data/dst', 0)).toBe(
+            'data/dst/0.json.gz'
+        )
+
+        // srcPrefix substring trap: 'data/src' must NOT silently match 'data/source/...'.
+        expect(() =>
+            cat._buildDestinationKey('data/source/year=2020', 'data/src', 'data/dst', 0)
+        ).toThrow(/not a path-descendant/)
+
+        // Completely unrelated prefix throws instead of writing to the wrong key.
+        expect(() =>
+            cat._buildDestinationKey('other/location/year=2020', 'data/src', 'data/dst', 0)
+        ).toThrow(/not a path-descendant/)
+    })
+
     it('backpressure is per-concatFilesAtPrefix call, not shared across parallel calls', async () => {
         // Both prefixes list the same number of keys; their GetObject calls block until we say
         // so. With a per-call limit of 1, sharing the counter (the pre-fix behavior) would mean
