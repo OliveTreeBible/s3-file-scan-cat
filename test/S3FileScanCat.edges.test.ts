@@ -431,6 +431,50 @@ describe('S3FileScanCat edges (mocked S3)', () => {
         expect(cat.s3ObjectsPutTotal).toBe(1)
     })
 
+    it('does not leak _s3PrefixListObjectsProcessCount when concat ListObjectsV2 throws', async () => {
+        s3Mock.on(ListObjectsV2Command).callsFake((input) => {
+            if (input.Delimiter === '/') {
+                return Promise.resolve({
+                    CommonPrefixes: [{ Prefix: 'data/src/year=2020/' }],
+                    IsTruncated: false,
+                })
+            }
+            return Promise.reject(new Error('list failed for concat'))
+        })
+
+        const cat = new S3FileScanCat(false, scannerOptions({ partitionStack: ['year'] }), testAwsSecrets)
+
+        await expect(cat.scanAndProcessFiles('bucket', 'data/src', 'data/dst')).rejects.toThrow(
+            'list failed for concat'
+        )
+
+        // Without the fix, the pre-await `++` would never be matched by a `--`.
+        expect(cat.s3PrefixListObjectsProcessCount).toBe(0)
+    })
+
+    it('does not leak _s3ObjectPutProcessCount when PutObject throws', async () => {
+        stubPartitionAndConcatList(() => ({
+            Contents: [{ Key: 'data/src/year=2020/a.json', Size: 8 }],
+            IsTruncated: false,
+        }))
+        s3Mock.on(GetObjectCommand).callsFake(() =>
+            Promise.resolve({
+                Body: sdkStreamMixin(Readable.from(['{"x":1}'])),
+            })
+        )
+        s3Mock.on(PutObjectCommand).rejects(new Error('put failed'))
+
+        const cat = new S3FileScanCat(false, scannerOptions({ partitionStack: ['year'] }), testAwsSecrets)
+
+        await expect(cat.scanAndProcessFiles('bucket', 'data/src', 'data/dst')).rejects.toThrow('put failed')
+
+        // Without the fix, the `++` happened before the failing send() and the matching `--` was
+        // unreachable past `throw e`.
+        expect(cat.s3ObjectPutProcessCount).toBe(0)
+        // A failed put should not count as a successful one.
+        expect(cat.s3ObjectsPutTotal).toBe(0)
+    })
+
     it('rejects concurrent scanAndProcessFiles calls on the same instance', async () => {
         stubPartitionAndConcatList(() => ({
             Contents: [{ Key: 'data/src/year=2020/a.json', Size: 8 }],

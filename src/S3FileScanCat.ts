@@ -311,72 +311,87 @@ export class S3FileScanCat {
                 } else {
                     listObjRequest.ContinuationToken = undefined
                 }
+                // Wrap the whole per-iteration unit of work (list call + Contents processing)
+                // in try/finally so `_s3PrefixListObjectsProcessCount` is always decremented,
+                // even if ListObjectsV2 rejects or the Contents loop throws.
                 this._s3PrefixListObjectsProcessCount++
-                let response: ListObjectsV2CommandOutput
                 try {
-                    void this._logger?.trace(
-                        `STATUS _concatFilesAtPrefix prefix=${prefix} - this._s3PrefixListObjectsProcessCount: ${this._s3PrefixListObjectsProcessCount}`
-                    )
-                    response = await this._s3Client.send(new ListObjectsV2Command(listObjRequest))
-                } catch (e) {
-                    void this._logger?.error(`Failed to list objects for ${listObjRequest.Prefix}, Error: ${e}`)
-                    throw e
-                }
-                if (response.Contents) {
-                    if (response.IsTruncated === true && response.NextContinuationToken !== undefined) {
-                        concatState.continuationToken = response.NextContinuationToken
-                    } else {
-                        concatState.continuationToken = undefined
+                    let response: ListObjectsV2CommandOutput
+                    try {
+                        void this._logger?.trace(
+                            `STATUS _concatFilesAtPrefix prefix=${prefix} - this._s3PrefixListObjectsProcessCount: ${this._s3PrefixListObjectsProcessCount}`
+                        )
+                        response = await this._s3Client.send(new ListObjectsV2Command(listObjRequest))
+                    } catch (e) {
+                        void this._logger?.error(
+                            `Failed to list objects for ${listObjRequest.Prefix}, Error: ${e}`
+                        )
+                        throw e
                     }
-                    for (const s3Object of response.Contents) {
-                        if (s3Object.Size && s3Object.Key) {
-                            await waitUntil(() => {
-                                if (this._fatalScanError) {
-                                    return true
-                                }
-                                if (this._s3ObjectBodyProcessInProgress < this._s3ObjectBodyProcessInProgressLimit) {
-                                    return true
-                                } else if (waits++ % 20 === 0) {
-                                    void this._logger?.trace(`Waiting on ListObjects to complete prefix=${srcPrefix} `)
-                                }
-                            })
-                            if (this._fatalScanError) {
-                                break
-                            }
-                            // We purposely do not await on this - the waitUntil above limits the number of these
-                            // calls that are in progress at any given moment. The promise is tracked in
-                            // `inFlightBodies` so the finally block can await it before returning.
-                            const bodyPromise: Promise<void> = this._getAndProcessObjectBody(
-                                bucket,
-                                s3Object.Key,
-                                concatState,
-                                prefix,
-                                srcPrefix,
-                                destPrefix
-                            )
-                                .catch((err: unknown) => {
-                                    void this._logger?.error(
-                                        `getObject/process failed for key=${s3Object.Key}: ${err instanceof Error ? err.message : String(err)}`
-                                    )
-                                    this._setFatalScanError(err)
-                                })
-                                .finally(() => {
-                                    inFlightBodies.delete(bodyPromise)
-                                })
-                            inFlightBodies.add(bodyPromise)
-                        } else if (s3Object.Size === 0) {
-                            void this._logger?.warn(`S3 Object had zero size ${JSON.stringify(s3Object.Key)}`)
+                    if (response.Contents) {
+                        if (response.IsTruncated === true && response.NextContinuationToken !== undefined) {
+                            concatState.continuationToken = response.NextContinuationToken
                         } else {
-                            throw new Error('Invalid S3 Object encountered.')
+                            concatState.continuationToken = undefined
                         }
+                        for (const s3Object of response.Contents) {
+                            if (s3Object.Size && s3Object.Key) {
+                                await waitUntil(() => {
+                                    if (this._fatalScanError) {
+                                        return true
+                                    }
+                                    if (
+                                        this._s3ObjectBodyProcessInProgress <
+                                        this._s3ObjectBodyProcessInProgressLimit
+                                    ) {
+                                        return true
+                                    } else if (waits++ % 20 === 0) {
+                                        void this._logger?.trace(
+                                            `Waiting on ListObjects to complete prefix=${srcPrefix} `
+                                        )
+                                    }
+                                })
+                                if (this._fatalScanError) {
+                                    break
+                                }
+                                // We purposely do not await on this - the waitUntil above limits the number of these
+                                // calls that are in progress at any given moment. The promise is tracked in
+                                // `inFlightBodies` so the finally block can await it before returning.
+                                const bodyPromise: Promise<void> = this._getAndProcessObjectBody(
+                                    bucket,
+                                    s3Object.Key,
+                                    concatState,
+                                    prefix,
+                                    srcPrefix,
+                                    destPrefix
+                                )
+                                    .catch((err: unknown) => {
+                                        void this._logger?.error(
+                                            `getObject/process failed for key=${s3Object.Key}: ${err instanceof Error ? err.message : String(err)}`
+                                        )
+                                        this._setFatalScanError(err)
+                                    })
+                                    .finally(() => {
+                                        inFlightBodies.delete(bodyPromise)
+                                    })
+                                inFlightBodies.add(bodyPromise)
+                            } else if (s3Object.Size === 0) {
+                                void this._logger?.warn(
+                                    `S3 Object had zero size ${JSON.stringify(s3Object.Key)}`
+                                )
+                            } else {
+                                throw new Error('Invalid S3 Object encountered.')
+                            }
+                        }
+                    } else {
+                        void this._logger?.warn(`Prefix had no contents: ${prefix}`)
                     }
-                } else {
-                    void this._logger?.warn(`Prefix had no contents: ${prefix}`)
+                } finally {
+                    this._s3PrefixListObjectsProcessCount--
+                    void this._logger?.trace(
+                        `STATUS _concatFilesAtPrefix prefix=${prefix} - _s3PrefixListObjectsProcessCount: ${this._s3PrefixListObjectsProcessCount}`
+                    )
                 }
-                this._s3PrefixListObjectsProcessCount--
-                void this._logger?.trace(
-                    `STATUS _concatFilesAtPrefix prefix=${prefix} - _s3PrefixListObjectsProcessCount: ${this._s3PrefixListObjectsProcessCount}`
-                )
             } while (concatState.continuationToken && !this._fatalScanError)
         } finally {
             // Always drain in-flight body processors before returning so they cannot
@@ -585,25 +600,31 @@ export class S3FileScanCat {
     async _saveToS3(bucket: string, buffer: string, key: string): Promise<void> {
         void this._logger?.trace(`BEGIN _saveToS3 key=${key} - _s3ObjectPutProcessCount: ${this._s3ObjectPutProcessCount}`)
 
+        // Wrap the entire "in-flight" lifecycle in try/finally so `_s3ObjectPutProcessCount`
+        // cannot leak if gzipSync throws or PutObject rejects.
         this._s3ObjectPutProcessCount++
-
-        const body = zlib.gzipSync(buffer)
-        const object: PutObjectCommandInput = {
-            Body: body,
-            Bucket: bucket,
-            Key: key,
-        }
         try {
-            await this._s3Client.send(new PutObjectCommand(object))
-        } catch (e) {
-            void this._logger?.error(`Failed to save object to S3: ${key}`)
-            throw e
+            const body = zlib.gzipSync(buffer)
+            const object: PutObjectCommandInput = {
+                Body: body,
+                Bucket: bucket,
+                Key: key,
+            }
+            try {
+                await this._s3Client.send(new PutObjectCommand(object))
+            } catch (e) {
+                void this._logger?.error(`Failed to save object to S3: ${key}`)
+                throw e
+            }
+            // Only bump the "successfully put" tally on the success path; the in-progress
+            // counter is always decremented below.
+            this._s3ObjectsPutTotal++
+        } finally {
+            this._s3ObjectPutProcessCount--
+            void this._logger?.trace(
+                `END _saveToS3 key=${key} - _s3ObjectPutProcessCount: ${this._s3ObjectPutProcessCount} - _s3ObjectsPutTotal: ${this._s3ObjectsPutTotal}`
+            )
         }
-        this._s3ObjectPutProcessCount--
-        this._s3ObjectsPutTotal++
-        void this._logger?.trace(
-            `END _saveToS3 key=${key} - _s3ObjectPutProcessCount: ${this._s3ObjectPutProcessCount} - _s3ObjectsPutTotal: ${this._s3ObjectsPutTotal}`
-        )
     }
 
     async _scanPrefixForPartitions(keyParams: PrefixParams): Promise<void> {
