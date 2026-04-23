@@ -99,3 +99,40 @@ export interface AWSSecrets {
     accessKeyId: string
     secretAccessKey: string
 }
+
+/**
+ * Snapshot of scanner runtime metrics, returned by `S3FileScanCat.getStats()`.
+ *
+ * All counters are scoped to the most recent `scanAndProcessFiles` invocation unless noted
+ * otherwise. The snapshot is atomic (all fields read in the same tick) and frozen.
+ */
+export interface S3FileScanCatStats {
+    /** Partition-scan workers (`_scanPrefixForPartitions`) currently in flight during phase 1. */
+    partitionScansInProgress: number
+    /**
+     * Whether a list-objects request is currently in flight inside `concatFilesAtPrefix`.
+     * Because concatFilesAtPrefix currently runs one leaf at a time this is effectively 0 or 1;
+     * the field is a number so that a future parallelization does not change its shape.
+     */
+    concatListObjectsInProgress: number
+    /** Leaf prefixes enqueued for the concat phase when the current run entered phase 2. */
+    totalPrefixesToProcess: number
+    /** Leaf prefixes processed so far in the current run. */
+    prefixesProcessedTotal: number
+    /** Leaf prefixes still queued, waiting to enter `concatFilesAtPrefix`. */
+    prefixesRemainingInQueue: number
+    /** GetObject body workers currently in flight; aggregate rollup across all concatFilesAtPrefix calls. */
+    s3ObjectBodyWorkersInProgress: number
+    /** PutObject calls currently in flight. */
+    s3ObjectPutWorkersInProgress: number
+    /** Total S3 objects successfully fetched in the current run. */
+    s3ObjectsFetchedTotal: number
+    /** Total S3 objects successfully put (output parts written) in the current run. */
+    s3ObjectsPutTotal: number
+    /** True while `scanAndProcessFiles` is executing on this instance. */
+    isRunning: boolean
+    /** True when the most recent `scanAndProcessFiles` completed successfully. */
+    isDone: boolean
+    /** True when `close()` has been called. */
+    isClosed: boolean
+}

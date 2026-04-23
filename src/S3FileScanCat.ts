@@ -17,7 +17,7 @@ import { NodeHttpHandler } from '@smithy/node-http-handler'
 
 import { EmptyPrefixError } from './errors/EmptyPrefixError'
 import {
-    AWSSecrets, ConcatState, PrefixEvalResult, PrefixParams, ScannerOptions
+    AWSSecrets, ConcatState, PrefixEvalResult, PrefixParams, S3FileScanCatStats, ScannerOptions
 } from './interfaces/scanner.interface'
 import { formatUtcYmdParts, utcDayStartMs } from './utcDayRange'
 import { waitUntil } from './waitUntil'
@@ -167,11 +167,34 @@ export class S3FileScanCat {
         return this._isClosed
     }
 
+    /**
+     * @deprecated Misnamed. The value is the number of partition-scan workers in flight, not a
+     * list-objects count. Prefer `partitionScansInProgress` or `getStats().partitionScansInProgress`.
+     * This getter will be removed in a future major version.
+     */
     get s3BuildPrefixListObjectsProcessCount(): number {
         return this._scanPrefixForPartitionsProcessCount
     }
 
+    /** Partition-scan workers (`_scanPrefixForPartitions`) currently in flight during phase 1. */
+    get partitionScansInProgress(): number {
+        return this._scanPrefixForPartitionsProcessCount
+    }
+
+    /**
+     * @deprecated The underlying value toggles 0/1 per concat-phase page rather than counting
+     * concurrent list-objects requests. Prefer `concatListObjectsInProgress` or
+     * `getStats().concatListObjectsInProgress`. This getter will be removed in a future major version.
+     */
     get s3PrefixListObjectsProcessCount(): number {
+        return this._s3PrefixListObjectsProcessCount
+    }
+
+    /**
+     * Whether a list-objects request is currently in flight inside `concatFilesAtPrefix`. Returned
+     * as a number (0 or 1 today, would grow if `concatFilesAtPrefix` is ever parallelized).
+     */
+    get concatListObjectsInProgress(): number {
         return this._s3PrefixListObjectsProcessCount
     }
 
@@ -205,6 +228,28 @@ export class S3FileScanCat {
 
     get isDone(): boolean {
         return this._isDone
+    }
+
+    /**
+     * Returns a frozen, atomic snapshot of all scanner metrics. Prefer this over calling the
+     * individual getters when sampling progress in a monitoring loop: all fields are read in
+     * the same tick, so internal counters cannot drift between reads.
+     */
+    getStats(): Readonly<S3FileScanCatStats> {
+        return Object.freeze({
+            partitionScansInProgress: this._scanPrefixForPartitionsProcessCount,
+            concatListObjectsInProgress: this._s3PrefixListObjectsProcessCount,
+            totalPrefixesToProcess: this._totalPrefixesToProcess,
+            prefixesProcessedTotal: this._prefixesProcessedTotal,
+            prefixesRemainingInQueue: this._allPrefixes.length,
+            s3ObjectBodyWorkersInProgress: this._s3ObjectBodyProcessInProgress,
+            s3ObjectPutWorkersInProgress: this._s3ObjectPutProcessCount,
+            s3ObjectsFetchedTotal: this._s3ObjectsFetchedTotal,
+            s3ObjectsPutTotal: this._s3ObjectsPutTotal,
+            isRunning: this._isRunning,
+            isDone: this._isDone,
+            isClosed: this._isClosed,
+        })
     }
 
     async scanAndProcessFiles(bucket: string, srcPrefix: string, destPrefix: string): Promise<void> {

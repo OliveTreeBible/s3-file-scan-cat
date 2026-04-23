@@ -225,6 +225,62 @@ describe('S3FileScanCat edges (mocked S3)', () => {
         expect(cat.s3ObjectsPutTotal).toBe(3)
     })
 
+    it('getStats() returns a frozen snapshot, and replacement getters mirror their deprecated counterparts', async () => {
+        stubPartitionAndConcatList(() => ({
+            Contents: [{ Key: 'data/src/year=2020/a.json', Size: 8 }],
+            IsTruncated: false,
+        }))
+        s3Mock.on(GetObjectCommand).callsFake(() =>
+            Promise.resolve({ Body: sdkStreamMixin(Readable.from(['{"x":1}'])) })
+        )
+        s3Mock.on(PutObjectCommand).resolves({})
+
+        const cat = new S3FileScanCat(false, scannerOptions({ partitionStack: ['year'] }), testAwsSecrets)
+
+        // Before any scan runs, every counter is zero and the lifecycle flags are clean.
+        const before = cat.getStats()
+        expect(before.partitionScansInProgress).toBe(0)
+        expect(before.concatListObjectsInProgress).toBe(0)
+        expect(before.totalPrefixesToProcess).toBe(0)
+        expect(before.prefixesProcessedTotal).toBe(0)
+        expect(before.prefixesRemainingInQueue).toBe(0)
+        expect(before.s3ObjectBodyWorkersInProgress).toBe(0)
+        expect(before.s3ObjectPutWorkersInProgress).toBe(0)
+        expect(before.s3ObjectsFetchedTotal).toBe(0)
+        expect(before.s3ObjectsPutTotal).toBe(0)
+        expect(before.isRunning).toBe(false)
+        expect(before.isDone).toBe(false)
+        expect(before.isClosed).toBe(false)
+
+        // The snapshot must be frozen; re-reading after mutation attempts should not change it.
+        expect(Object.isFrozen(before)).toBe(true)
+        expect(() => {
+            ;(before as { s3ObjectsPutTotal: number }).s3ObjectsPutTotal = 999
+        }).toThrow(TypeError)
+        expect(before.s3ObjectsPutTotal).toBe(0)
+
+        await cat.scanAndProcessFiles('bucket', 'data/src', 'data/dst')
+
+        const after = cat.getStats()
+        expect(after.totalPrefixesToProcess).toBe(1)
+        expect(after.prefixesProcessedTotal).toBe(1)
+        expect(after.prefixesRemainingInQueue).toBe(0)
+        expect(after.s3ObjectsFetchedTotal).toBe(1)
+        expect(after.s3ObjectsPutTotal).toBe(1)
+        expect(after.isRunning).toBe(false)
+        expect(after.isDone).toBe(true)
+        expect(after.isClosed).toBe(false)
+
+        // Replacement getters must mirror the deprecated ones, so the old surface keeps working
+        // for any consumer that hasn't migrated yet.
+        expect(cat.partitionScansInProgress).toBe(cat.s3BuildPrefixListObjectsProcessCount)
+        expect(cat.concatListObjectsInProgress).toBe(cat.s3PrefixListObjectsProcessCount)
+
+        // After close() the lifecycle flag flips.
+        cat.close()
+        expect(cat.getStats().isClosed).toBe(true)
+    })
+
     it('_buildDestinationKey handles trailing-slash variants, mismatched paths, and deep leaves', () => {
         const cat = new S3FileScanCat(false, scannerOptions({ partitionStack: ['year'] }), testAwsSecrets)
 
