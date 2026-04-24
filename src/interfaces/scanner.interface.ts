@@ -47,6 +47,41 @@ export interface ScannerLimits {
      * which was easy to trip on legitimate traffic.
      */
     requestSocketTimeoutMs?: number
+    /**
+     * Max number of leaf `concatFilesAtPrefix` calls in flight concurrently during phase 2.
+     * Must be >= 1. Default **1** (original behavior: leaves are processed strictly one at a
+     * time). Raising this fans out cross-leaf work so a run with many small leaves isn't
+     * bottlenecked by a partially-utilized per-leaf body budget.
+     *
+     * Memory trade-off: each in-flight leaf holds its own concat buffer (bounded by
+     * `maxFileSizeBytes`) plus a `pendingBodies` map of unreleased source bodies. Peak
+     * concat-buffer memory grows as `concatFilesAtPrefixProcessLimit × maxFileSizeBytes`.
+     *
+     * Socket trade-off: concurrent `ListObjectsV2` in phase 1 is capped by
+     * `scanPrefixForPartitionsProcessLimit`; phase 2 can run one listing stream per in-flight leaf
+     * (`concatFilesAtPrefixProcessLimit`). Together with `s3ObjectBodyProcessTotalLimit` and
+     * `s3ObjectPutProcessLimit`, keep aggregate S3 concurrency comfortably below the client's
+     * `maxSockets` (500) so list/get/put don't starve each other.
+     */
+    concatFilesAtPrefixProcessLimit?: number
+    /**
+     * Class-level cap on the total number of `_getAndProcessObjectBody` workers in flight
+     * across all leaves (aggregate of every leaf's `ConcatState.bodiesInFlight` plus
+     * oversized-skip bookkeeping). Must be >= `s3ObjectBodyProcessInProgressLimit` when
+     * supplied, to avoid starving a single leaf (the inner gate checks both caps).
+     *
+     * Default **Infinity** (opt-in). When `concatFilesAtPrefixProcessLimit > 1`, set this to
+     * bound socket usage and peak `pendingBodies` memory across concurrent leaves.
+     */
+    s3ObjectBodyProcessTotalLimit?: number
+    /**
+     * Class-level cap on the total number of `PutObject` calls in flight at any moment. Must be
+     * >= 1. Default **Infinity** (unchanged behavior). Intended to keep parallel leaves from
+     * monopolizing the socket pool during flushes; gating is applied at the start of
+     * `_saveToS3` before the in-flight counter is incremented, so published counters stay
+     * accurate.
+     */
+    s3ObjectPutProcessLimit?: number
 }
 
 export interface AWSConfig {
@@ -133,9 +168,15 @@ export interface S3FileScanCatStats {
     /** Partition-scan workers (`_scanPrefixForPartitions`) currently in flight during phase 1. */
     partitionScansInProgress: number
     /**
-     * Whether a list-objects request is currently in flight inside `concatFilesAtPrefix`.
-     * Because concatFilesAtPrefix currently runs one leaf at a time this is effectively 0 or 1;
-     * the field is a number so that a future parallelization does not change its shape.
+     * `concatFilesAtPrefix` calls currently in flight during phase 2. Bounded by
+     * `concatFilesAtPrefixProcessLimit` (default 1 = strictly sequential; raise for cross-leaf
+     * parallelism).
+     */
+    concatFilesInProgress: number
+    /**
+     * Sum of list-objects requests currently in flight across all active `concatFilesAtPrefix`
+     * calls. Effectively 0 or 1 when `concatFilesAtPrefixProcessLimit === 1`; can grow up to
+     * `concatFilesAtPrefixProcessLimit` when multiple leaves run in parallel.
      */
     concatListObjectsInProgress: number
     /** Leaf prefixes enqueued for the concat phase when the current run entered phase 2. */

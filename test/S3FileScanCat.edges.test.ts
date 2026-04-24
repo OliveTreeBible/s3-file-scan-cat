@@ -1572,4 +1572,562 @@ describe('S3FileScanCat edges (mocked S3)', () => {
         await first
         expect(cat.isDone).toBe(true)
     })
+
+    it('defaults to serial leaf concat (concatFilesAtPrefixProcessLimit = 1)', async () => {
+        // Back-compat guard: with the new limit unset, the second leaf MUST NOT begin until the
+        // first has finished. We prove this deterministically by holding the first leaf's
+        // GetObject unresolved and asserting no second concat call has started. Sampling a
+        // counter on a timer can miss brief spikes; pinning the first worker makes the absence
+        // of the second observable.
+        const leaves = ['data/src/year=2020/', 'data/src/year=2021/', 'data/src/year=2022/']
+        s3Mock.on(ListObjectsV2Command).callsFake((input) => {
+            if (input.Delimiter === '/') {
+                return Promise.resolve({
+                    CommonPrefixes: leaves.map((p) => ({ Prefix: p })),
+                    IsTruncated: false,
+                })
+            }
+            return Promise.resolve({
+                Contents: [{ Key: `${input.Prefix}one.json`, Size: 8 }],
+                IsTruncated: false,
+            })
+        })
+
+        // Key → resolver for that key's GetObject.
+        const resolvers = new Map<string, (v: unknown) => void>()
+        s3Mock.on(GetObjectCommand).callsFake(
+            (input) =>
+                new Promise((resolve) => {
+                    resolvers.set(input.Key ?? '', resolve as (v: unknown) => void)
+                })
+        )
+        s3Mock.on(PutObjectCommand).resolves({})
+
+        const cat = new S3FileScanCat(false, scannerOptions({ partitionStack: ['year'] }), testAwsSecrets)
+        const run = cat.scanAndProcessFiles('bucket', 'data/src', 'data/dst')
+
+        // Wait for the first leaf's GetObject to register. In serial mode, this is the only
+        // pending Get until we release it.
+        const firstKey = `${leaves[0]}one.json`
+        const secondKey = `${leaves[1]}one.json`
+        for (let i = 0; i < 50 && !resolvers.has(firstKey); i++) {
+            await new Promise((r) => setTimeout(r, 5))
+        }
+        expect(resolvers.has(firstKey)).toBe(true)
+        // Give the event loop plenty of chances to incorrectly start leaf 2. If parallelism
+        // regresses, leaf 2's list + GetObject would register during these ticks.
+        for (let i = 0; i < 20; i++) {
+            await new Promise((r) => setTimeout(r, 5))
+        }
+        expect(resolvers.size).toBe(1)
+        expect(resolvers.has(secondKey)).toBe(false)
+        expect(cat.getStats().concatFilesInProgress).toBe(1)
+
+        // Release each leaf in sequence. After leaf N completes, leaf N+1 should be the next
+        // and only leaf to register a GetObject.
+        for (let i = 0; i < leaves.length; i++) {
+            const key = `${leaves[i]}one.json`
+            expect(resolvers.has(key)).toBe(true)
+            resolvers.get(key)!({ Body: sdkStreamMixin(Readable.from(['{"k":1}'])) })
+            if (i + 1 < leaves.length) {
+                const nextKey = `${leaves[i + 1]}one.json`
+                for (let j = 0; j < 50 && !resolvers.has(nextKey); j++) {
+                    await new Promise((r) => setTimeout(r, 5))
+                }
+                expect(resolvers.has(nextKey)).toBe(true)
+                // At no point should two leaves be concurrently in flight in serial mode.
+                expect(cat.getStats().concatFilesInProgress).toBe(1)
+            }
+        }
+
+        await run
+        expect(cat.prefixesProcessedTotal).toBe(leaves.length)
+        expect(cat.getStats().concatFilesInProgress).toBe(0)
+    })
+
+    it('runs multiple leaves in parallel when concatFilesAtPrefixProcessLimit > 1', async () => {
+        // Two leaves each hold their GetObject open until we release. If leaves really run in
+        // parallel we should see two list-objects calls AND two pending GetObjects before
+        // releasing either.
+        const leaves = ['data/src/year=2020/', 'data/src/year=2021/']
+        s3Mock.on(ListObjectsV2Command).callsFake((input) => {
+            if (input.Delimiter === '/') {
+                return Promise.resolve({
+                    CommonPrefixes: leaves.map((p) => ({ Prefix: p })),
+                    IsTruncated: false,
+                })
+            }
+            return Promise.resolve({
+                Contents: [{ Key: `${input.Prefix}a.json`, Size: 8 }],
+                IsTruncated: false,
+            })
+        })
+
+        const pendingResolvers: Array<(v: unknown) => void> = []
+        s3Mock.on(GetObjectCommand).callsFake(
+            () =>
+                new Promise((resolve) => {
+                    pendingResolvers.push(resolve as (v: unknown) => void)
+                })
+        )
+        s3Mock.on(PutObjectCommand).resolves({})
+
+        const cat = new S3FileScanCat(
+            false,
+            scannerOptions({
+                partitionStack: ['year'],
+                limits: { concatFilesAtPrefixProcessLimit: 2 },
+            }),
+            testAwsSecrets
+        )
+        const run = cat.scanAndProcessFiles('bucket', 'data/src', 'data/dst')
+
+        for (let i = 0; i < 50 && pendingResolvers.length < 2; i++) {
+            await new Promise((r) => setTimeout(r, 5))
+        }
+        expect(pendingResolvers.length).toBe(2)
+        // Both leaves must be in flight concurrently for both GetObjects to register.
+        expect(cat.getStats().concatFilesInProgress).toBe(2)
+
+        pendingResolvers[0]({ Body: sdkStreamMixin(Readable.from(['{"x":1}'])) })
+        pendingResolvers[1]({ Body: sdkStreamMixin(Readable.from(['{"y":2}'])) })
+        await run
+
+        expect(cat.isDone).toBe(true)
+        const putKeys = s3Mock.commandCalls(PutObjectCommand).map((c) => c.args[0].input.Key).sort()
+        expect(putKeys).toEqual(['data/dst/year=2020/0.json.gz', 'data/dst/year=2021/0.json.gz'])
+    })
+
+    it('enforces s3ObjectBodyProcessTotalLimit across parallel leaves', async () => {
+        // Three leaves, each with two keys, and a class-level cap of 3. Without the cap the peak
+        // in-flight would be 3 leaves * 2 keys = 6; with the cap we must never exceed 3.
+        const leaves = ['data/src/year=2020/', 'data/src/year=2021/', 'data/src/year=2022/']
+        s3Mock.on(ListObjectsV2Command).callsFake((input) => {
+            if (input.Delimiter === '/') {
+                return Promise.resolve({
+                    CommonPrefixes: leaves.map((p) => ({ Prefix: p })),
+                    IsTruncated: false,
+                })
+            }
+            return Promise.resolve({
+                Contents: [
+                    { Key: `${input.Prefix}a.json`, Size: 8 },
+                    { Key: `${input.Prefix}b.json`, Size: 8 },
+                ],
+                IsTruncated: false,
+            })
+        })
+
+        const pendingResolvers: Array<(v: unknown) => void> = []
+        s3Mock.on(GetObjectCommand).callsFake(
+            () =>
+                new Promise((resolve) => {
+                    pendingResolvers.push(resolve as (v: unknown) => void)
+                })
+        )
+        s3Mock.on(PutObjectCommand).resolves({})
+
+        const cat = new S3FileScanCat(
+            false,
+            scannerOptions({
+                partitionStack: ['year'],
+                limits: {
+                    concatFilesAtPrefixProcessLimit: 3,
+                    s3ObjectBodyProcessInProgressLimit: 2,
+                    s3ObjectBodyProcessTotalLimit: 3,
+                },
+            }),
+            testAwsSecrets
+        )
+        const run = cat.scanAndProcessFiles('bucket', 'data/src', 'data/dst')
+
+        // Give the scan time to saturate to the cap.
+        let peakBodies = 0
+        for (let i = 0; i < 30; i++) {
+            await new Promise((r) => setTimeout(r, 5))
+            peakBodies = Math.max(peakBodies, cat.getStats().s3ObjectBodyWorkersInProgress)
+        }
+        expect(peakBodies).toBe(3)
+        // More than 3 would mean the cap was violated; fewer would be a starvation bug.
+        expect(pendingResolvers.length).toBe(3)
+
+        // Drain. As each in-flight body resolves, another should slot in until all 6 are done.
+        for (let i = 0; i < 6; i++) {
+            while (pendingResolvers.length <= i) {
+                await new Promise((r) => setTimeout(r, 5))
+            }
+            // Assert the in-flight total never exceeded the cap while draining either.
+            expect(cat.getStats().s3ObjectBodyWorkersInProgress).toBeLessThanOrEqual(3)
+            pendingResolvers[i]({ Body: sdkStreamMixin(Readable.from(['{"k":1}'])) })
+        }
+        await run
+        expect(cat.prefixesProcessedTotal).toBe(3)
+    })
+
+    it('enforces s3ObjectPutProcessLimit across parallel leaves', async () => {
+        // Three leaves in parallel, each writes one output part. Cap PutObject at 1 and verify
+        // it is never exceeded.
+        const leaves = ['data/src/year=2020/', 'data/src/year=2021/', 'data/src/year=2022/']
+        s3Mock.on(ListObjectsV2Command).callsFake((input) => {
+            if (input.Delimiter === '/') {
+                return Promise.resolve({
+                    CommonPrefixes: leaves.map((p) => ({ Prefix: p })),
+                    IsTruncated: false,
+                })
+            }
+            return Promise.resolve({
+                Contents: [{ Key: `${input.Prefix}a.json`, Size: 8 }],
+                IsTruncated: false,
+            })
+        })
+        s3Mock.on(GetObjectCommand).callsFake(() =>
+            Promise.resolve({ Body: sdkStreamMixin(Readable.from(['{"k":1}'])) })
+        )
+
+        // Hold each PutObject for a tick so the scanner has to queue them.
+        const putResolvers: Array<() => void> = []
+        s3Mock.on(PutObjectCommand).callsFake(
+            () =>
+                new Promise<object>((resolve) => {
+                    putResolvers.push(() => resolve({}))
+                })
+        )
+
+        const cat = new S3FileScanCat(
+            false,
+            scannerOptions({
+                partitionStack: ['year'],
+                limits: {
+                    concatFilesAtPrefixProcessLimit: 3,
+                    s3ObjectPutProcessLimit: 1,
+                },
+            }),
+            testAwsSecrets
+        )
+        const run = cat.scanAndProcessFiles('bucket', 'data/src', 'data/dst')
+
+        // Exactly one PutObject should be in flight at a time; wait for the first to register.
+        for (let i = 0; i < 50 && putResolvers.length < 1; i++) {
+            await new Promise((r) => setTimeout(r, 5))
+        }
+        expect(putResolvers.length).toBe(1)
+        expect(cat.getStats().s3ObjectPutWorkersInProgress).toBe(1)
+
+        // Release in order, each time waiting for the next PUT to be dispatched.
+        for (let i = 0; i < 3; i++) {
+            expect(cat.getStats().s3ObjectPutWorkersInProgress).toBeLessThanOrEqual(1)
+            putResolvers[i]()
+            if (i < 2) {
+                for (let j = 0; j < 50 && putResolvers.length <= i + 1; j++) {
+                    await new Promise((r) => setTimeout(r, 5))
+                }
+            }
+        }
+        await run
+        expect(cat.s3ObjectsPutTotal).toBe(3)
+    })
+
+    it('drains parallel leaves and rethrows the original error when one leaf fails', async () => {
+        // Leaf A rejects during GetObject; leaf B blocks on GetObject. Confirm scanAndProcessFiles
+        // rejects with A's error, B is drained before the outer rejection resolves, and no stray
+        // Put lands after the rejection.
+        const leaves = ['data/src/year=2020/', 'data/src/year=2021/']
+        s3Mock.on(ListObjectsV2Command).callsFake((input) => {
+            if (input.Delimiter === '/') {
+                return Promise.resolve({
+                    CommonPrefixes: leaves.map((p) => ({ Prefix: p })),
+                    IsTruncated: false,
+                })
+            }
+            return Promise.resolve({
+                Contents: [{ Key: `${input.Prefix}a.json`, Size: 8 }],
+                IsTruncated: false,
+            })
+        })
+
+        let releaseB: (() => void) | undefined
+        s3Mock.on(GetObjectCommand).callsFake((input) => {
+            if (input.Key === 'data/src/year=2020/a.json') {
+                return Promise.reject(Object.assign(new Error('boom-A'), { name: 'AccessDenied' }))
+            }
+            return new Promise((resolve) => {
+                releaseB = () => resolve({ Body: sdkStreamMixin(Readable.from(['{"y":2}'])) })
+            })
+        })
+        s3Mock.on(PutObjectCommand).resolves({})
+
+        const cat = new S3FileScanCat(
+            false,
+            scannerOptions({
+                partitionStack: ['year'],
+                limits: { concatFilesAtPrefixProcessLimit: 2, waitUntilTimeoutMs: 5_000 },
+            }),
+            testAwsSecrets
+        )
+        const run = cat.scanAndProcessFiles('bucket', 'data/src', 'data/dst')
+
+        // Wait for leaf B to register its pending GetObject.
+        for (let i = 0; i < 50 && releaseB === undefined; i++) {
+            await new Promise((r) => setTimeout(r, 5))
+        }
+        expect(typeof releaseB).toBe('function')
+
+        // Let leaf B complete after leaf A has failed; the drain must pick it up.
+        releaseB?.()
+        await expect(run).rejects.toThrow('boom-A')
+
+        // No rogue work left running after rejection.
+        expect(cat.getStats().concatFilesInProgress).toBe(0)
+        expect(cat.getStats().s3ObjectBodyWorkersInProgress).toBe(0)
+        expect(cat.getStats().s3ObjectPutWorkersInProgress).toBe(0)
+    })
+
+    it('_saveToS3 abandons the PUT after a fatal error even with unbounded PutObject cap', async () => {
+        // Regression test: prior to the fix, the Infinity (default) branch of `_saveToS3`
+        // bumped the counter and proceeded to gzip + PutObject without checking fatal, so a
+        // detached flush could land a PUT after the scan had already rejected. Now we abandon
+        // consistently regardless of whether the PUT cap is finite or infinite.
+        s3Mock.on(PutObjectCommand).resolves({})
+
+        const cat = new S3FileScanCat(
+            false,
+            scannerOptions({ partitionStack: ['year'] }),
+            testAwsSecrets
+        )
+        // Default is Infinity — this exercises the formerly unchecked branch.
+        expect((cat as unknown as { _s3ObjectPutProcessLimit: number })._s3ObjectPutProcessLimit).toBe(
+            Number.POSITIVE_INFINITY
+        )
+
+        cat._setFatalScanError(new Error('prior failure'))
+        // Calling _saveToS3 directly is the clearest way to pin the branch.
+        await cat._saveToS3('bucket', 'ignored body', 'data/dst/should-not-exist.json.gz')
+
+        expect(s3Mock.commandCalls(PutObjectCommand).length).toBe(0)
+        expect(cat.s3ObjectsPutTotal).toBe(0)
+        expect(cat.s3ObjectPutProcessCount).toBe(0)
+    })
+
+    it('_resetRunState() clears phase-2 concurrency state for subsequent runs', async () => {
+        stubPartitionAndConcatList(() => ({
+            Contents: [{ Key: 'data/src/year=2020/a.json', Size: 8 }],
+            IsTruncated: false,
+        }))
+        s3Mock.on(GetObjectCommand).callsFake(() =>
+            Promise.resolve({ Body: sdkStreamMixin(Readable.from(['{"x":1}'])) })
+        )
+        s3Mock.on(PutObjectCommand).resolves({})
+
+        const cat = new S3FileScanCat(
+            false,
+            scannerOptions({
+                partitionStack: ['year'],
+                limits: { concatFilesAtPrefixProcessLimit: 2 },
+            }),
+            testAwsSecrets
+        )
+        await cat.scanAndProcessFiles('bucket', 'data/src', 'data/dst')
+        expect(cat.isDone).toBe(true)
+        expect(cat.getStats().concatFilesInProgress).toBe(0)
+
+        // Second run on the same instance must not observe leftover counters.
+        await cat.scanAndProcessFiles('bucket', 'data/src', 'data/dst')
+        expect(cat.isDone).toBe(true)
+        expect(cat.getStats().concatFilesInProgress).toBe(0)
+        expect(cat.prefixesProcessedTotal).toBe(1)
+    })
+
+    it('rejects invalid concurrency limits at construction', () => {
+        expect(
+            () =>
+                new S3FileScanCat(
+                    false,
+                    scannerOptions({
+                        partitionStack: ['year'],
+                        limits: { concatFilesAtPrefixProcessLimit: 0 },
+                    }),
+                    testAwsSecrets
+                )
+        ).toThrow(/concatFilesAtPrefixProcessLimit/)
+
+        expect(
+            () =>
+                new S3FileScanCat(
+                    false,
+                    scannerOptions({
+                        partitionStack: ['year'],
+                        limits: {
+                            s3ObjectBodyProcessInProgressLimit: 10,
+                            s3ObjectBodyProcessTotalLimit: 5,
+                        },
+                    }),
+                    testAwsSecrets
+                )
+        ).toThrow(/s3ObjectBodyProcessTotalLimit/)
+
+        expect(
+            () =>
+                new S3FileScanCat(
+                    false,
+                    scannerOptions({
+                        partitionStack: ['year'],
+                        limits: { s3ObjectPutProcessLimit: 0 },
+                    }),
+                    testAwsSecrets
+                )
+        ).toThrow(/s3ObjectPutProcessLimit/)
+    })
+
+    it('rejects fractional concurrency limits at construction (cap could otherwise be exceeded)', () => {
+        // Every gate compares `count < limit` and then bumps by 1. A fractional limit like 1.5
+        // would let 2 workers through (1 < 1.5), which violates the cap. Require integers.
+        expect(
+            () =>
+                new S3FileScanCat(
+                    false,
+                    scannerOptions({
+                        partitionStack: ['year'],
+                        limits: { concatFilesAtPrefixProcessLimit: 1.5 },
+                    }),
+                    testAwsSecrets
+                )
+        ).toThrow(/concatFilesAtPrefixProcessLimit/)
+
+        expect(
+            () =>
+                new S3FileScanCat(
+                    false,
+                    scannerOptions({
+                        partitionStack: ['year'],
+                        limits: { concatFilesAtPrefixProcessLimit: Number.POSITIVE_INFINITY },
+                    }),
+                    testAwsSecrets
+                )
+        ).toThrow(/concatFilesAtPrefixProcessLimit/)
+
+        expect(
+            () =>
+                new S3FileScanCat(
+                    false,
+                    scannerOptions({
+                        partitionStack: ['year'],
+                        limits: {
+                            s3ObjectBodyProcessInProgressLimit: 2,
+                            s3ObjectBodyProcessTotalLimit: 2.5,
+                        },
+                    }),
+                    testAwsSecrets
+                )
+        ).toThrow(/s3ObjectBodyProcessTotalLimit/)
+
+        expect(
+            () =>
+                new S3FileScanCat(
+                    false,
+                    scannerOptions({
+                        partitionStack: ['year'],
+                        limits: { s3ObjectPutProcessLimit: 3.25 },
+                    }),
+                    testAwsSecrets
+                )
+        ).toThrow(/s3ObjectPutProcessLimit/)
+
+        // Infinity is allowed for the two caps that default to Infinity.
+        expect(
+            () =>
+                new S3FileScanCat(
+                    false,
+                    scannerOptions({
+                        partitionStack: ['year'],
+                        limits: {
+                            s3ObjectBodyProcessTotalLimit: Number.POSITIVE_INFINITY,
+                            s3ObjectPutProcessLimit: Number.POSITIVE_INFINITY,
+                        },
+                    }),
+                    testAwsSecrets
+                )
+        ).not.toThrow()
+    })
+
+    it('rejects NaN and non-number concurrency limits (gates would never open otherwise)', () => {
+        // NaN would make every `count < NaN` comparison false, so the predicate never returns
+        // true and `waitUntil` spins until the timeout. Surface it at construction instead.
+        expect(
+            () =>
+                new S3FileScanCat(
+                    false,
+                    scannerOptions({
+                        partitionStack: ['year'],
+                        limits: { concatFilesAtPrefixProcessLimit: Number.NaN },
+                    }),
+                    testAwsSecrets
+                )
+        ).toThrow(/concatFilesAtPrefixProcessLimit/)
+
+        expect(
+            () =>
+                new S3FileScanCat(
+                    false,
+                    scannerOptions({
+                        partitionStack: ['year'],
+                        limits: { s3ObjectBodyProcessTotalLimit: Number.NaN },
+                    }),
+                    testAwsSecrets
+                )
+        ).toThrow(/s3ObjectBodyProcessTotalLimit/)
+
+        expect(
+            () =>
+                new S3FileScanCat(
+                    false,
+                    scannerOptions({
+                        partitionStack: ['year'],
+                        limits: { s3ObjectPutProcessLimit: Number.NaN },
+                    }),
+                    testAwsSecrets
+                )
+        ).toThrow(/s3ObjectPutProcessLimit/)
+
+        // Non-number runtime values (bypassing TS) must also be rejected.
+        expect(
+            () =>
+                new S3FileScanCat(
+                    false,
+                    scannerOptions({
+                        partitionStack: ['year'],
+                        limits: {
+                            s3ObjectPutProcessLimit: '10' as unknown as number,
+                        },
+                    }),
+                    testAwsSecrets
+                )
+        ).toThrow(/s3ObjectPutProcessLimit/)
+
+        expect(
+            () =>
+                new S3FileScanCat(
+                    false,
+                    scannerOptions({
+                        partitionStack: ['year'],
+                        limits: {
+                            concatFilesAtPrefixProcessLimit: null as unknown as number,
+                        },
+                    }),
+                    testAwsSecrets
+                )
+        ).toThrow(/concatFilesAtPrefixProcessLimit/)
+
+        // Negative Infinity is a number but not a legitimate limit.
+        expect(
+            () =>
+                new S3FileScanCat(
+                    false,
+                    scannerOptions({
+                        partitionStack: ['year'],
+                        limits: { s3ObjectPutProcessLimit: Number.NEGATIVE_INFINITY },
+                    }),
+                    testAwsSecrets
+                )
+        ).toThrow(/s3ObjectPutProcessLimit/)
+    })
 })

@@ -74,6 +74,19 @@ export class S3FileScanCat {
     /** Once true, every future `scanAndProcessFiles` call rejects instead of issuing S3 traffic. */
     private _isClosed: boolean = false
     private _s3ObjectBodyProcessInProgressLimit: number
+    /** Class-level cap on aggregate `_getAndProcessObjectBody` workers; see ScannerLimits. */
+    private _s3ObjectBodyProcessTotalLimit: number
+    /** Class-level cap on concurrent `PutObject` calls; `Infinity` by default. */
+    private _s3ObjectPutProcessLimit: number
+    /** Max concurrent `concatFilesAtPrefix` calls in phase 2 (default 1 = sequential). */
+    private _concatFilesAtPrefixProcessLimit: number
+    /** Number of `concatFilesAtPrefix` calls currently in flight; see phase-2 worker spawn. */
+    private _concatFilesAtPrefixProcessCount: number = 0
+    /**
+     * Tracks every in-flight `concatFilesAtPrefix` promise so phase-2 can drain them on fatal
+     * error or normal completion before returning (mirrors `_inFlightPartitionScans`).
+     */
+    private _inFlightConcatCalls: Set<Promise<void>> = new Set()
     private _maxFileSizeBytes: number
     /** Upper bound on listing `Size` before we will issue GetObject (defaults to maxFileSizeBytes). */
     private _maxSourceObjectSizeBytes: number
@@ -114,6 +127,39 @@ export class S3FileScanCat {
             scannerOptions.limits?.s3ObjectBodyProcessInProgressLimit !== undefined
                 ? scannerOptions.limits?.s3ObjectBodyProcessInProgressLimit
                 : 100
+        // New concurrency limits (phase-2 parallelism). Validation happens here so bad config
+        // fails fast at construction instead of deep inside the scan. Every gate compares
+        // `count < limit` and bumps the counter by exactly 1, so the limit MUST be an
+        // integer: a limit of 1.5 would allow 2 workers (1 < 1.5) and silently violate the cap,
+        // and a limit of NaN would make every comparison false — producing an indefinite
+        // `waitUntil` spin that only breaks at `waitUntilTimeoutMs`.
+        this._concatFilesAtPrefixProcessLimit = S3FileScanCat._validateConcurrencyLimit(
+            'concatFilesAtPrefixProcessLimit',
+            scannerOptions.limits?.concatFilesAtPrefixProcessLimit,
+            { defaultValue: 1, allowInfinity: false }
+        )
+        // Default Infinity (opt-in) so existing callers — including any who drive
+        // `concatFilesAtPrefix` directly across calls — see no change. When explicitly set,
+        // the value must be a positive integer (same rationale as above) and >= the per-leaf
+        // limit so a single leaf cannot deadlock on itself (the inner gate checks both caps).
+        this._s3ObjectBodyProcessTotalLimit = S3FileScanCat._validateConcurrencyLimit(
+            's3ObjectBodyProcessTotalLimit',
+            scannerOptions.limits?.s3ObjectBodyProcessTotalLimit,
+            { defaultValue: Number.POSITIVE_INFINITY, allowInfinity: true }
+        )
+        if (
+            scannerOptions.limits?.s3ObjectBodyProcessTotalLimit !== undefined &&
+            this._s3ObjectBodyProcessTotalLimit < this._s3ObjectBodyProcessInProgressLimit
+        ) {
+            throw new RangeError(
+                `scannerOptions.limits.s3ObjectBodyProcessTotalLimit (${this._s3ObjectBodyProcessTotalLimit}) must be >= s3ObjectBodyProcessInProgressLimit (${this._s3ObjectBodyProcessInProgressLimit}).`
+            )
+        }
+        this._s3ObjectPutProcessLimit = S3FileScanCat._validateConcurrencyLimit(
+            's3ObjectPutProcessLimit',
+            scannerOptions.limits?.s3ObjectPutProcessLimit,
+            { defaultValue: Number.POSITIVE_INFINITY, allowInfinity: true }
+        )
         this._maxFileSizeBytes =
             scannerOptions.limits?.maxFileSizeBytes !== undefined
                 ? scannerOptions.limits?.maxFileSizeBytes
@@ -228,20 +274,28 @@ export class S3FileScanCat {
     }
 
     /**
-     * @deprecated The underlying value toggles 0/1 per concat-phase page rather than counting
-     * concurrent list-objects requests. Prefer `concatListObjectsInProgress` or
-     * `getStats().concatListObjectsInProgress`. This getter will be removed in a future major version.
+     * @deprecated Misnamed. The value is the aggregate number of list-objects requests currently
+     * in flight across all active `concatFilesAtPrefix` calls — 0 or 1 when
+     * `concatFilesAtPrefixProcessLimit === 1`, and up to that limit when multiple leaves run in
+     * parallel. Prefer `concatListObjectsInProgress` or `getStats().concatListObjectsInProgress`.
+     * This getter will be removed in a future major version.
      */
     get s3PrefixListObjectsProcessCount(): number {
         return this._s3PrefixListObjectsProcessCount
     }
 
     /**
-     * Whether a list-objects request is currently in flight inside `concatFilesAtPrefix`. Returned
-     * as a number (0 or 1 today, would grow if `concatFilesAtPrefix` is ever parallelized).
+     * Sum of list-objects requests currently in flight across all active `concatFilesAtPrefix`
+     * calls. Effectively 0 or 1 while `concatFilesAtPrefixProcessLimit === 1`; can grow up to
+     * that limit once cross-leaf parallelism is enabled.
      */
     get concatListObjectsInProgress(): number {
         return this._s3PrefixListObjectsProcessCount
+    }
+
+    /** Leaf `concatFilesAtPrefix` calls currently in flight (phase-2 workers). */
+    get concatFilesInProgress(): number {
+        return this._concatFilesAtPrefixProcessCount
     }
 
     get totalPrefixesToProcess(): number {
@@ -297,6 +351,7 @@ export class S3FileScanCat {
     getStats(): Readonly<S3FileScanCatStats> {
         return Object.freeze({
             partitionScansInProgress: this._scanPrefixForPartitionsProcessCount,
+            concatFilesInProgress: this._concatFilesAtPrefixProcessCount,
             concatListObjectsInProgress: this._s3PrefixListObjectsProcessCount,
             totalPrefixesToProcess: this._totalPrefixesToProcess,
             prefixesProcessedTotal: this._prefixesProcessedTotal,
@@ -449,24 +504,64 @@ export class S3FileScanCat {
             throw this._fatalScanError
         }
         this._totalPrefixesToProcess = this._allPrefixesRemaining()
-        if (this._totalPrefixesToProcess > 0) {
-            while (this._allPrefixesRemaining() > 0) {
-                const prefix = this._takeAllPrefix()
-                if (prefix) {
-                    await this.concatFilesAtPrefix(bucket, prefix, srcPrefix, destPath)
-                }
-            }
-        } else {
+        if (this._totalPrefixesToProcess <= 0) {
             throw new EmptyPrefixError()
         }
+        // Phase 2 fan-out. Mirrors phase 1 in intent but uses a Promise.race over the in-flight
+        // set instead of `waitUntil` polling — with `concatFilesAtPrefixProcessLimit === 1` and
+        // thousands of small leaves, a 10ms poll loop would add multi-second overhead for work
+        // that is otherwise essentially instant.
+        try {
+            while (
+                (this._allPrefixesRemaining() > 0 || this._inFlightConcatCalls.size > 0) &&
+                !this._fatalScanError
+            ) {
+                // Spawn as many leaves as the cap allows before blocking.
+                while (
+                    !this._fatalScanError &&
+                    this._allPrefixesRemaining() > 0 &&
+                    this._concatFilesAtPrefixProcessCount < this._concatFilesAtPrefixProcessLimit
+                ) {
+                    const prefix = this._takeAllPrefix()
+                    if (prefix === undefined) {
+                        break
+                    }
+                    this._concatFilesAtPrefixProcessCount++
+                    const concatPromise: Promise<void> = this.concatFilesAtPrefix(
+                        bucket,
+                        prefix,
+                        srcPrefix,
+                        destPath
+                    )
+                        .catch((err: unknown) => {
+                            void this._logger?.error(
+                                `Leaf concat failed for prefix=${prefix}: ${err instanceof Error ? err.message : String(err)}`
+                            )
+                            this._setFatalScanError(err)
+                        })
+                        .finally(() => {
+                            this._concatFilesAtPrefixProcessCount--
+                            this._inFlightConcatCalls.delete(concatPromise)
+                        })
+                    this._inFlightConcatCalls.add(concatPromise)
+                }
+                // Wait for at least one leaf to finish before considering the next batch. Each
+                // promise is `.catch`-wrapped above, so Promise.race never rejects here.
+                if (this._inFlightConcatCalls.size > 0) {
+                    await Promise.race([...this._inFlightConcatCalls])
+                }
+            }
+        } finally {
+            // Drain in-flight leaves regardless of outcome so callers never see
+            // `scanAndProcessFiles` resolve/reject while background concat is still running.
+            if (this._inFlightConcatCalls.size > 0) {
+                await Promise.allSettled([...this._inFlightConcatCalls])
+            }
+        }
+        if (this._fatalScanError) {
+            throw this._fatalScanError
+        }
 
-        // The sequential `await this.concatFilesAtPrefix(...)` loop above guarantees every
-        // leaf has finished concat (`_prefixesProcessedTotal`), and `_prefixesWithEmittedOutputTotal`
-        // has been updated for leaves that wrote at least one part, before we arrive here, so
-        // there is nothing left to wait for. A previous `waitUntil(... === ...)` at this
-        // spot was dead code *and* ignored `_fatalScanError`, which would have been a real
-        // hazard if the loop was ever parallelized. Removing it rather than "fixing" it
-        // because the explicit sequential await is already the correct invariant.
         void this._logger?.info(`Finished concatenating and compressing JSON S3 Objects for prefix=${srcPrefix}`)
         await this._logger?.flush()
         this._isDone = true
@@ -561,27 +656,26 @@ export class S3FileScanCat {
                                 void this._logger?.warn(
                                     `Skipping GetObject: listing Size (${s3Object.Size}) exceeds maxSourceObjectSizeBytes (${this._maxSourceObjectSizeBytes}) for key=${s3Object.Key}; preserving ordering with an empty slot.`
                                 )
+                                const oversizedSlot = { reserved: false }
                                 await waitUntil(
-                                    () => {
-                                        if (this._fatalScanError) {
-                                            return true
-                                        }
-                                        if (
-                                            concatState.bodiesInFlight <
-                                            this._s3ObjectBodyProcessInProgressLimit
-                                        ) {
-                                            return true
-                                        } else if (waits++ % 20 === 0) {
-                                            void this._logger?.trace(
-                                                `Waiting until GetObject body workers drop below limit (leafPrefix=${prefix}, inFlight=${concatState.bodiesInFlight}, limit=${this._s3ObjectBodyProcessInProgressLimit})`
-                                            )
-                                        }
-                                    },
+                                    () =>
+                                        this._tryAcquireBodySlot(
+                                            concatState,
+                                            prefix,
+                                            () => waits++,
+                                            oversizedSlot
+                                        ),
                                     { timeout: this._waitUntilTimeoutMs }
                                 )
                                 if (this._fatalScanError) {
+                                    if (oversizedSlot.reserved) {
+                                        this._releaseBodySlotReservation(concatState)
+                                    }
                                     break
                                 }
+                                // The slot was reserved synchronously inside the acquire
+                                // predicate so a sibling leaf cannot observe the gate as open
+                                // before we have bumped the counters.
                                 const seq = nextSeq++
                                 const objectKey = s3Object.Key
                                 const skipPromise: Promise<void> = this._skipListedObjectOversizedForConcat(
@@ -605,29 +699,21 @@ export class S3FileScanCat {
                                 inFlightBodies.add(skipPromise)
                                 continue
                             }
+                            const bodySlot = { reserved: false }
                             await waitUntil(
-                                () => {
-                                    if (this._fatalScanError) {
-                                        return true
-                                    }
-                                    // Per-call backpressure: only this invocation's body workers
-                                    // count against the limit, so parallel concatFilesAtPrefix
-                                    // calls (if ever introduced) get their own concurrency budget
-                                    // instead of starving each other through a shared counter.
-                                    if (
-                                        concatState.bodiesInFlight <
-                                        this._s3ObjectBodyProcessInProgressLimit
-                                    ) {
-                                        return true
-                                    } else if (waits++ % 20 === 0) {
-                                        void this._logger?.trace(
-                                            `Waiting until GetObject body workers drop below limit (leafPrefix=${prefix}, inFlight=${concatState.bodiesInFlight}, limit=${this._s3ObjectBodyProcessInProgressLimit})`
-                                        )
-                                    }
-                                },
+                                () =>
+                                    this._tryAcquireBodySlot(
+                                        concatState,
+                                        prefix,
+                                        () => waits++,
+                                        bodySlot
+                                    ),
                                 { timeout: this._waitUntilTimeoutMs }
                             )
                             if (this._fatalScanError) {
+                                if (bodySlot.reserved) {
+                                    this._releaseBodySlotReservation(concatState)
+                                }
                                 break
                             }
                             // Assign the listing-order sequence BEFORE spawning so that even
@@ -789,8 +875,8 @@ export class S3FileScanCat {
         seq: number,
         s3Key: string
     ): Promise<void> {
-        concatState.bodiesInFlight++
-        this._s3ObjectBodyProcessInProgress++
+        // Counters were reserved synchronously by `_tryAcquireBodySlot` before spawn;
+        // we only need to release them here.
         try {
             if (this._fatalScanError) {
                 return
@@ -820,11 +906,11 @@ export class S3FileScanCat {
         destPrefix: string,
         seq: number
     ): Promise<void> {
-        // Per-call counter is authoritative for backpressure inside this concatFilesAtPrefix
-        // invocation. The class-level counter is retained as an aggregate rollup for the
+        // Counters were reserved synchronously by `_tryAcquireBodySlot` before this spawn, so
+        // the gate + bump happen in a single sync step (no microtask race across parallel
+        // leaves). We only release here. The per-call counter remains authoritative for
+        // in-leaf ordering; the class-level one is retained as an aggregate rollup for the
         // public `s3ObjectBodyProcessInProgress` getter.
-        concatState.bodiesInFlight++
-        this._s3ObjectBodyProcessInProgress++
         void this._logger?.trace(
             `BEGIN _getObjectBody objectKey=${s3Key} - _s3ObjectBodyProcessCount: ${this._s3ObjectBodyProcessInProgress}`
         )
@@ -949,6 +1035,52 @@ export class S3FileScanCat {
     }
 
     /**
+     * Validate a concurrency-limit option. Concurrency gates are implemented as `count < limit`
+     * followed by `count++`, so the limit must be an integer (fractional values would allow
+     * overshoot) and must be a real number (NaN would make every comparison false, causing
+     * `waitUntil` to spin until the configured timeout).
+     *
+     * @param name Field name (for error messages).
+     * @param raw Caller-supplied value (may be `undefined` to select the default).
+     * @param options Validation configuration.
+     * @param options.defaultValue Value to use when `raw === undefined`. Assumed to be already valid.
+     * @param options.allowInfinity Whether `Number.POSITIVE_INFINITY` is an accepted value. Use
+     *   `true` for "unbounded" caps that the caller opts into explicitly; `false` for counts that
+     *   must correspond to a discrete number of workers.
+     */
+    private static _validateConcurrencyLimit(
+        name: string,
+        raw: number | undefined,
+        options: { defaultValue: number; allowInfinity: boolean }
+    ): number {
+        if (raw === undefined) {
+            return options.defaultValue
+        }
+        if (typeof raw !== 'number' || Number.isNaN(raw)) {
+            throw new RangeError(
+                `scannerOptions.limits.${name} must be a number; received ${raw === null ? 'null' : typeof raw}${Number.isNaN(raw as number) ? ' (NaN)' : ''}.`
+            )
+        }
+        if (raw === Number.POSITIVE_INFINITY) {
+            if (!options.allowInfinity) {
+                throw new RangeError(
+                    `scannerOptions.limits.${name} must be a finite integer >= 1; Infinity is not allowed.`
+                )
+            }
+            return raw
+        }
+        if (!Number.isInteger(raw) || raw < 1) {
+            const allowedSuffix = options.allowInfinity
+                ? ' or Infinity'
+                : ''
+            throw new RangeError(
+                `scannerOptions.limits.${name} must be an integer >= 1${allowedSuffix}; received ${raw}.`
+            )
+        }
+        return raw
+    }
+
+    /**
      * Reset every per-run field so the instance can be safely reused across
      * multiple `scanAndProcessFiles` invocations (including after a failure).
      * Fields tied to configuration (S3 client, logger, limits) are preserved.
@@ -970,6 +1102,8 @@ export class S3FileScanCat {
         this._isDone = false
         this._fatalScanError = undefined
         this._inFlightPartitionScans = new Set()
+        this._concatFilesAtPrefixProcessCount = 0
+        this._inFlightConcatCalls = new Set()
     }
 
     /** Number of items still to be taken from the `_keyParams` queue. */
@@ -1005,6 +1139,56 @@ export class S3FileScanCat {
         ;(this._allPrefixes as (string | undefined)[])[this._allPrefixesHead] = undefined
         this._allPrefixesHead++
         return item
+    }
+
+    /**
+     * Undo a successful `_tryAcquireBodySlot` bump when the caller will not spawn
+     * `_getAndProcessObjectBody` / `_skipListedObjectOversizedForConcat` (e.g. fatal scan error
+     * after `waitUntil` resolved).
+     */
+    private _releaseBodySlotReservation(concatState: ConcatState): void {
+        concatState.bodiesInFlight--
+        this._s3ObjectBodyProcessInProgress--
+    }
+
+    /**
+     * Atomic check-and-increment used as the `waitUntil` predicate for body-worker slots.
+     * Runs synchronously, so the gate evaluation and the counter bump are inseparable — even
+     * with multiple `concatFilesAtPrefix` calls racing, no two can both observe the gate as
+     * open without the second seeing the first's increment. Returns true on fatal error so the
+     * caller can abort (no counters are bumped on the fatal path).
+     *
+     * Releasing is done by `_getAndProcessObjectBody` / `_skipListedObjectOversizedForConcat`
+     * in their `finally` blocks. Callers that acquire inside `waitUntil` and may `break` before
+     * spawning those workers pass `acquiredOut`; on fatal after `waitUntil` resolves, they must
+     * call `_releaseBodySlotReservation` when `acquiredOut.reserved` is true.
+     */
+    private _tryAcquireBodySlot(
+        concatState: ConcatState,
+        prefix: string,
+        bumpWaits: () => number,
+        acquiredOut?: { reserved: boolean }
+    ): boolean {
+        if (this._fatalScanError) {
+            return true
+        }
+        if (
+            concatState.bodiesInFlight < this._s3ObjectBodyProcessInProgressLimit &&
+            this._s3ObjectBodyProcessInProgress < this._s3ObjectBodyProcessTotalLimit
+        ) {
+            concatState.bodiesInFlight++
+            this._s3ObjectBodyProcessInProgress++
+            if (acquiredOut !== undefined) {
+                acquiredOut.reserved = true
+            }
+            return true
+        }
+        if (bumpWaits() % 20 === 0) {
+            void this._logger?.trace(
+                `Waiting until GetObject body workers drop below limits (leafPrefix=${prefix}, leafInFlight=${concatState.bodiesInFlight}/${this._s3ObjectBodyProcessInProgressLimit}, totalInFlight=${this._s3ObjectBodyProcessInProgress}/${this._s3ObjectBodyProcessTotalLimit})`
+            )
+        }
+        return false
     }
 
     /** Serialize buffer reads/writes/flushes across concurrent `_getAndProcessObjectBody` calls. */
@@ -1191,9 +1375,50 @@ export class S3FileScanCat {
     async _saveToS3(bucket: string, buffer: string, key: string): Promise<void> {
         void this._logger?.trace(`BEGIN _saveToS3 key=${key} - _s3ObjectPutProcessCount: ${this._s3ObjectPutProcessCount}`)
 
-        // Wrap the entire "in-flight" lifecycle in try/finally so `_s3ObjectPutProcessCount`
-        // cannot leak if gzip throws or PutObject rejects.
-        this._s3ObjectPutProcessCount++
+        // Fast fatal-error abort so a PUT never lands for a run that has already failed. This
+        // must run before the counter bump in either the finite or infinite branch below,
+        // otherwise the infinite branch would happily gzip + PUT after a sibling has rejected.
+        if (this._fatalScanError) {
+            void this._logger?.trace(
+                `Abandoning _saveToS3 key=${key} due to prior fatal scan error.`
+            )
+            return
+        }
+
+        // Acquire a PutObject slot (class-level cap). The atomic check-and-bump inside the
+        // predicate means two racing flush promises cannot both observe the gate as open. With
+        // the default `Infinity` limit the predicate succeeds on the first evaluation, so
+        // `waitUntil` never awaits its poll timer (`setTimeout` between checks). A fatal error
+        // observed mid-wait short-circuits without bumping, and we abandon the PUT below.
+        let putSlotAcquired = false
+        let putWaits = 0
+        await waitUntil(
+            () => {
+                if (this._fatalScanError) {
+                    return true
+                }
+                if (this._s3ObjectPutProcessCount < this._s3ObjectPutProcessLimit) {
+                    this._s3ObjectPutProcessCount++
+                    putSlotAcquired = true
+                    return true
+                }
+                if (putWaits++ % 20 === 0) {
+                    void this._logger?.trace(
+                        `Waiting until PutObject workers drop below limit (inFlight=${this._s3ObjectPutProcessCount}, limit=${this._s3ObjectPutProcessLimit})`
+                    )
+                }
+                return false
+            },
+            { timeout: this._waitUntilTimeoutMs }
+        )
+        if (!putSlotAcquired) {
+            // Fatal became set while we were waiting for a slot; nothing to release.
+            void this._logger?.trace(
+                `Abandoning _saveToS3 key=${key} due to fatal scan error during slot wait.`
+            )
+            return
+        }
+
         try {
             const body = await gzipAsync(buffer)
             const object: PutObjectCommandInput = {
@@ -1211,7 +1436,9 @@ export class S3FileScanCat {
             // counter is always decremented below.
             this._s3ObjectsPutTotal++
         } finally {
-            this._s3ObjectPutProcessCount--
+            if (putSlotAcquired) {
+                this._s3ObjectPutProcessCount--
+            }
             void this._logger?.trace(
                 `END _saveToS3 key=${key} - _s3ObjectPutProcessCount: ${this._s3ObjectPutProcessCount} - _s3ObjectsPutTotal: ${this._s3ObjectsPutTotal}`
             )
