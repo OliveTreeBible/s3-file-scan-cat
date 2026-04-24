@@ -85,10 +85,10 @@ Phase 1 (partition discovery) fans out up to `scanPrefixForPartitionsProcessLimi
 Phase 2 (concatenate-and-write) supports three optional knobs that default to the original strictly-sequential behavior, so upgrades are safe without any config changes:
 
 - **`concatFilesAtPrefixProcessLimit`** — max leaf prefixes being concatenated at once. Default `1` (sequential). Raising this is the primary speedup lever when you have many small leaves.
-- **`s3ObjectBodyProcessTotalLimit`** — class-wide cap on in-flight `GetObject` bodies across all concurrent leaves. Default `Infinity`. Must be >= `s3ObjectBodyProcessInProgressLimit`. Use this together with `concatFilesAtPrefixProcessLimit > 1` to bound socket usage on the shared S3 HTTP(S) agents (which cap at 500 sockets).
+- **`s3ObjectBodyProcessTotalLimit`** — class-wide cap on in-flight `GetObject` bodies across all concurrent leaves. Default `Infinity`. Must be >= `s3ObjectBodyProcessInProgressLimit`. Use this together with `concatFilesAtPrefixProcessLimit > 1` to bound concurrent `GetObject` work on the shared S3 HTTP(S) agents (default `maxSockets` is **500 total** across list, get, and put).
 - **`s3ObjectPutProcessLimit`** — cap on concurrent `PutObject` calls across the whole scanner. Default `Infinity`. Pair with `concatFilesAtPrefixProcessLimit > 1` to avoid flush-time bursts against the destination prefix.
 
-Memory/socket ceilings to watch: peak concat-buffer memory is roughly `concatFilesAtPrefixProcessLimit × maxFileSizeBytes`, and peak source-body memory is bounded by `s3ObjectBodyProcessTotalLimit × maxSourceObjectSizeBytes`. Keep `s3ObjectBodyProcessTotalLimit + s3ObjectPutProcessLimit` comfortably below the `500` `maxSockets` budget so lists, gets, and puts don't starve one another.
+Memory/socket ceilings to watch: peak concat-buffer memory is roughly `concatFilesAtPrefixProcessLimit × maxFileSizeBytes`, and peak source-body memory is bounded by `s3ObjectBodyProcessTotalLimit × maxSourceObjectSizeBytes`. Sockets are shared: phase 1 runs up to `scanPrefixForPartitionsProcessLimit` concurrent `ListObjectsV2` calls, phase 2 can run about one listing stream per in-flight leaf (`concatFilesAtPrefixProcessLimit`), and `GetObject` / `PutObject` concurrency is capped by `s3ObjectBodyProcessTotalLimit` / `s3ObjectPutProcessLimit`. Keep that **aggregate** demand comfortably below the `500` `maxSockets` budget so lists, gets, and puts don't starve one another.
 
 ### Performing the scan
 
