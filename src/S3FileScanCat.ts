@@ -1339,44 +1339,48 @@ export class S3FileScanCat {
     async _saveToS3(bucket: string, buffer: string, key: string): Promise<void> {
         void this._logger?.trace(`BEGIN _saveToS3 key=${key} - _s3ObjectPutProcessCount: ${this._s3ObjectPutProcessCount}`)
 
-        // Class-level PutObject cap. The `tryAcquire` predicate performs the check-and-bump
-        // atomically (synchronously) so racing flush promises cannot both observe the gate as
-        // open. With the default `Infinity` the predicate always acquires on the first call and
-        // this is a no-op. When fatal, we short-circuit without bumping.
-        let putSlotAcquired = false
-        if (Number.isFinite(this._s3ObjectPutProcessLimit)) {
-            let putWaits = 0
-            await waitUntil(
-                () => {
-                    if (this._fatalScanError) {
-                        return true
-                    }
-                    if (this._s3ObjectPutProcessCount < this._s3ObjectPutProcessLimit) {
-                        this._s3ObjectPutProcessCount++
-                        putSlotAcquired = true
-                        return true
-                    }
-                    if (putWaits++ % 20 === 0) {
-                        void this._logger?.trace(
-                            `Waiting until PutObject workers drop below limit (inFlight=${this._s3ObjectPutProcessCount}, limit=${this._s3ObjectPutProcessLimit})`
-                        )
-                    }
-                    return false
-                },
-                { timeout: this._waitUntilTimeoutMs }
+        // Fast fatal-error abort so a PUT never lands for a run that has already failed. This
+        // must run before the counter bump in either the finite or infinite branch below,
+        // otherwise the infinite branch would happily gzip + PUT after a sibling has rejected.
+        if (this._fatalScanError) {
+            void this._logger?.trace(
+                `Abandoning _saveToS3 key=${key} due to prior fatal scan error.`
             )
-            if (this._fatalScanError && !putSlotAcquired) {
-                // Honor the same abort semantics as other workers: skip the PUT and let the
-                // outer flush tracker's allSettled drain it. No counters to revert.
-                void this._logger?.trace(
-                    `Abandoning _saveToS3 key=${key} due to prior fatal scan error.`
-                )
-                return
-            }
-        } else {
-            // Unbounded: bump eagerly so both branches share the release path below.
-            this._s3ObjectPutProcessCount++
-            putSlotAcquired = true
+            return
+        }
+
+        // Acquire a PutObject slot (class-level cap). The atomic check-and-bump inside the
+        // predicate means two racing flush promises cannot both observe the gate as open. With
+        // the default `Infinity` limit the predicate succeeds on the very first call, so this
+        // reduces to a single microtask yield. A fatal error observed mid-wait short-circuits
+        // without bumping, and we abandon the PUT below.
+        let putSlotAcquired = false
+        let putWaits = 0
+        await waitUntil(
+            () => {
+                if (this._fatalScanError) {
+                    return true
+                }
+                if (this._s3ObjectPutProcessCount < this._s3ObjectPutProcessLimit) {
+                    this._s3ObjectPutProcessCount++
+                    putSlotAcquired = true
+                    return true
+                }
+                if (putWaits++ % 20 === 0) {
+                    void this._logger?.trace(
+                        `Waiting until PutObject workers drop below limit (inFlight=${this._s3ObjectPutProcessCount}, limit=${this._s3ObjectPutProcessLimit})`
+                    )
+                }
+                return false
+            },
+            { timeout: this._waitUntilTimeoutMs }
+        )
+        if (!putSlotAcquired) {
+            // Fatal became set while we were waiting for a slot; nothing to release.
+            void this._logger?.trace(
+                `Abandoning _saveToS3 key=${key} due to fatal scan error during slot wait.`
+            )
+            return
         }
 
         try {

@@ -1574,10 +1574,12 @@ describe('S3FileScanCat edges (mocked S3)', () => {
     })
 
     it('defaults to serial leaf concat (concatFilesAtPrefixProcessLimit = 1)', async () => {
-        // Back-compat guard: with the new limit unset, only one concatFilesAtPrefix call is in
-        // flight at a time. Verify by watching `concatFilesInProgress` (new stat) while leaves
-        // list.
-        const leaves = Array.from({ length: 4 }, (_, i) => `data/src/year=${2020 + i}/`)
+        // Back-compat guard: with the new limit unset, the second leaf MUST NOT begin until the
+        // first has finished. We prove this deterministically by holding the first leaf's
+        // GetObject unresolved and asserting no second concat call has started. Sampling a
+        // counter on a timer can miss brief spikes; pinning the first worker makes the absence
+        // of the second observable.
+        const leaves = ['data/src/year=2020/', 'data/src/year=2021/', 'data/src/year=2022/']
         s3Mock.on(ListObjectsV2Command).callsFake((input) => {
             if (input.Delimiter === '/') {
                 return Promise.resolve({
@@ -1590,25 +1592,57 @@ describe('S3FileScanCat edges (mocked S3)', () => {
                 IsTruncated: false,
             })
         })
-        s3Mock.on(GetObjectCommand).callsFake(() =>
-            Promise.resolve({ Body: sdkStreamMixin(Readable.from(['{"k":1}'])) })
+
+        // Key → resolver for that key's GetObject.
+        const resolvers = new Map<string, (v: unknown) => void>()
+        s3Mock.on(GetObjectCommand).callsFake(
+            (input) =>
+                new Promise((resolve) => {
+                    resolvers.set(input.Key ?? '', resolve as (v: unknown) => void)
+                })
         )
         s3Mock.on(PutObjectCommand).resolves({})
 
         const cat = new S3FileScanCat(false, scannerOptions({ partitionStack: ['year'] }), testAwsSecrets)
+        const run = cat.scanAndProcessFiles('bucket', 'data/src', 'data/dst')
 
-        // Sample `concatFilesInProgress` periodically while the scan runs.
-        let peakConcat = 0
-        const sampler = setInterval(() => {
-            peakConcat = Math.max(peakConcat, cat.getStats().concatFilesInProgress)
-        }, 1)
-        try {
-            await cat.scanAndProcessFiles('bucket', 'data/src', 'data/dst')
-        } finally {
-            clearInterval(sampler)
+        // Wait for the first leaf's GetObject to register. In serial mode, this is the only
+        // pending Get until we release it.
+        const firstKey = `${leaves[0]}one.json`
+        const secondKey = `${leaves[1]}one.json`
+        for (let i = 0; i < 50 && !resolvers.has(firstKey); i++) {
+            await new Promise((r) => setTimeout(r, 5))
         }
-        expect(peakConcat).toBeLessThanOrEqual(1)
+        expect(resolvers.has(firstKey)).toBe(true)
+        // Give the event loop plenty of chances to incorrectly start leaf 2. If parallelism
+        // regresses, leaf 2's list + GetObject would register during these ticks.
+        for (let i = 0; i < 20; i++) {
+            await new Promise((r) => setTimeout(r, 5))
+        }
+        expect(resolvers.size).toBe(1)
+        expect(resolvers.has(secondKey)).toBe(false)
+        expect(cat.getStats().concatFilesInProgress).toBe(1)
+
+        // Release each leaf in sequence. After leaf N completes, leaf N+1 should be the next
+        // and only leaf to register a GetObject.
+        for (let i = 0; i < leaves.length; i++) {
+            const key = `${leaves[i]}one.json`
+            expect(resolvers.has(key)).toBe(true)
+            resolvers.get(key)!({ Body: sdkStreamMixin(Readable.from(['{"k":1}'])) })
+            if (i + 1 < leaves.length) {
+                const nextKey = `${leaves[i + 1]}one.json`
+                for (let j = 0; j < 50 && !resolvers.has(nextKey); j++) {
+                    await new Promise((r) => setTimeout(r, 5))
+                }
+                expect(resolvers.has(nextKey)).toBe(true)
+                // At no point should two leaves be concurrently in flight in serial mode.
+                expect(cat.getStats().concatFilesInProgress).toBe(1)
+            }
+        }
+
+        await run
         expect(cat.prefixesProcessedTotal).toBe(leaves.length)
+        expect(cat.getStats().concatFilesInProgress).toBe(0)
     })
 
     it('runs multiple leaves in parallel when concatFilesAtPrefixProcessLimit > 1', async () => {
@@ -1846,6 +1880,32 @@ describe('S3FileScanCat edges (mocked S3)', () => {
         expect(cat.getStats().concatFilesInProgress).toBe(0)
         expect(cat.getStats().s3ObjectBodyWorkersInProgress).toBe(0)
         expect(cat.getStats().s3ObjectPutWorkersInProgress).toBe(0)
+    })
+
+    it('_saveToS3 abandons the PUT after a fatal error even with unbounded PutObject cap', async () => {
+        // Regression test: prior to the fix, the Infinity (default) branch of `_saveToS3`
+        // bumped the counter and proceeded to gzip + PutObject without checking fatal, so a
+        // detached flush could land a PUT after the scan had already rejected. Now we abandon
+        // consistently regardless of whether the PUT cap is finite or infinite.
+        s3Mock.on(PutObjectCommand).resolves({})
+
+        const cat = new S3FileScanCat(
+            false,
+            scannerOptions({ partitionStack: ['year'] }),
+            testAwsSecrets
+        )
+        // Default is Infinity — this exercises the formerly unchecked branch.
+        expect((cat as unknown as { _s3ObjectPutProcessLimit: number })._s3ObjectPutProcessLimit).toBe(
+            Number.POSITIVE_INFINITY
+        )
+
+        cat._setFatalScanError(new Error('prior failure'))
+        // Calling _saveToS3 directly is the clearest way to pin the branch.
+        await cat._saveToS3('bucket', 'ignored body', 'data/dst/should-not-exist.json.gz')
+
+        expect(s3Mock.commandCalls(PutObjectCommand).length).toBe(0)
+        expect(cat.s3ObjectsPutTotal).toBe(0)
+        expect(cat.s3ObjectPutProcessCount).toBe(0)
     })
 
     it('_resetRunState() clears phase-2 concurrency state for subsequent runs', async () => {
