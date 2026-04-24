@@ -996,22 +996,87 @@ export class S3FileScanCat {
 
     /**
      * Returns false when the error is a client-side failure that retrying cannot fix
-     * (4xx except 408 RequestTimeout and 429 TooManyRequests). Unknown / network / 5xx
-     * errors remain retryable.
+     * (4xx except 408 RequestTimeout and 429 TooManyRequests). When `httpStatusCode` is
+     * missing (mocks, proxies, or non-AWS errors), uses Smithy `$fault`, exception `name`,
+     * and conservative message heuristics so we do not burn the full backoff ladder on
+     * obvious non-retries; plain `Error` with no signals stays retryable for transport glitches.
      */
     _isRetryableError(err: unknown): boolean {
-        if (err && typeof err === 'object') {
-            const status = (err as { $metadata?: { httpStatusCode?: number } }).$metadata
-                ?.httpStatusCode
-            if (typeof status === 'number') {
-                if (status === 408 || status === 429) {
-                    return true
-                }
-                if (status >= 400 && status < 500) {
-                    return false
-                }
-            }
+        if (err == null || typeof err !== 'object') {
+            return true
         }
+        const e = err as {
+            $metadata?: { httpStatusCode?: number }
+            $fault?: string
+            name?: string
+            message?: string
+        }
+        const status = e.$metadata?.httpStatusCode
+        if (typeof status === 'number') {
+            if (status === 408 || status === 429) {
+                return true
+            }
+            if (status >= 400 && status < 500) {
+                return false
+            }
+            return true
+        }
+
+        const name = e.name ?? ''
+        const message = typeof e.message === 'string' ? e.message : ''
+
+        const nonRetryableNames = new Set([
+            'AccessDenied',
+            'UnauthorizedOperation',
+            'NoSuchKey',
+            'NoSuchBucket',
+            'NoSuchVersion',
+            'InvalidObjectState',
+            'InvalidRequest',
+            'MalformedKey',
+            'KeyTooLongError',
+            'InvalidRange',
+        ])
+        if (nonRetryableNames.has(name)) {
+            return false
+        }
+
+        const retryableNames = new Set([
+            'ThrottlingException',
+            'TooManyRequestsException',
+            'RequestTimeout',
+            'RequestTimeoutException',
+            'ServiceUnavailable',
+            'SlowDown',
+            'InternalError',
+            'PriorRequestNotComplete',
+        ])
+        if (retryableNames.has(name)) {
+            return true
+        }
+
+        if (e.$fault === 'client') {
+            return false
+        }
+        if (e.$fault === 'server') {
+            return true
+        }
+
+        if (/throttl|slow\s*down|ECONNRESET|ETIMEDOUT|ENOTFOUND|EAI_AGAIN|socket hang up|request timed out/i.test(message)) {
+            return true
+        }
+        if (
+            /access denied|not authorized|no such key|no such bucket|forbidden|invalid access key|signature does not match/i.test(
+                message
+            )
+        ) {
+            return false
+        }
+
+        if (!(err instanceof Error)) {
+            return false
+        }
+
         return true
     }
 

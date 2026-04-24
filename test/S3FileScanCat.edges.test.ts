@@ -655,6 +655,22 @@ describe('S3FileScanCat edges (mocked S3)', () => {
         expect(resolvedRegion).toBe('eu-west-2')
     })
 
+    it('_isRetryableError classifies errors without httpStatusCode via name, $fault, and message', () => {
+        const cat = new S3FileScanCat(false, scannerOptions({ partitionStack: ['year'] }), testAwsSecrets)
+
+        expect(cat._isRetryableError(Object.assign(new Error('x'), { name: 'AccessDenied' }))).toBe(false)
+        expect(cat._isRetryableError({ name: 'NoSuchKey', message: '' })).toBe(false)
+        expect(cat._isRetryableError(new Error('ThrottlingException'))).toBe(true)
+        expect(cat._isRetryableError(new Error('ECONNRESET on read'))).toBe(true)
+        expect(cat._isRetryableError(new Error('access denied by policy'))).toBe(false)
+
+        expect(cat._isRetryableError({ $fault: 'client', name: 'Custom', message: '' })).toBe(false)
+        expect(cat._isRetryableError({ $fault: 'server', name: 'Custom', message: '' })).toBe(true)
+
+        expect(cat._isRetryableError({ code: 'ENOENT' })).toBe(false)
+        expect(cat._isRetryableError(new Error('permanent failure'))).toBe(true)
+    })
+
     it('fails fast without retrying on a non-retryable 4xx S3 error (_isRetryableError)', async () => {
         stubPartitionAndConcatList(() => ({
             Contents: [{ Key: 'data/src/year=2020/forbidden.json', Size: 8 }],
