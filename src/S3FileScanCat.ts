@@ -656,12 +656,21 @@ export class S3FileScanCat {
                                 void this._logger?.warn(
                                     `Skipping GetObject: listing Size (${s3Object.Size}) exceeds maxSourceObjectSizeBytes (${this._maxSourceObjectSizeBytes}) for key=${s3Object.Key}; preserving ordering with an empty slot.`
                                 )
+                                const oversizedSlot = { reserved: false }
                                 await waitUntil(
                                     () =>
-                                        this._tryAcquireBodySlot(concatState, prefix, () => waits++),
+                                        this._tryAcquireBodySlot(
+                                            concatState,
+                                            prefix,
+                                            () => waits++,
+                                            oversizedSlot
+                                        ),
                                     { timeout: this._waitUntilTimeoutMs }
                                 )
                                 if (this._fatalScanError) {
+                                    if (oversizedSlot.reserved) {
+                                        this._releaseBodySlotReservation(concatState)
+                                    }
                                     break
                                 }
                                 // The slot was reserved synchronously inside the acquire
@@ -690,11 +699,21 @@ export class S3FileScanCat {
                                 inFlightBodies.add(skipPromise)
                                 continue
                             }
+                            const bodySlot = { reserved: false }
                             await waitUntil(
-                                () => this._tryAcquireBodySlot(concatState, prefix, () => waits++),
+                                () =>
+                                    this._tryAcquireBodySlot(
+                                        concatState,
+                                        prefix,
+                                        () => waits++,
+                                        bodySlot
+                                    ),
                                 { timeout: this._waitUntilTimeoutMs }
                             )
                             if (this._fatalScanError) {
+                                if (bodySlot.reserved) {
+                                    this._releaseBodySlotReservation(concatState)
+                                }
                                 break
                             }
                             // Assign the listing-order sequence BEFORE spawning so that even
@@ -1123,6 +1142,16 @@ export class S3FileScanCat {
     }
 
     /**
+     * Undo a successful `_tryAcquireBodySlot` bump when the caller will not spawn
+     * `_getAndProcessObjectBody` / `_skipListedObjectOversizedForConcat` (e.g. fatal scan error
+     * after `waitUntil` resolved).
+     */
+    private _releaseBodySlotReservation(concatState: ConcatState): void {
+        concatState.bodiesInFlight--
+        this._s3ObjectBodyProcessInProgress--
+    }
+
+    /**
      * Atomic check-and-increment used as the `waitUntil` predicate for body-worker slots.
      * Runs synchronously, so the gate evaluation and the counter bump are inseparable — even
      * with multiple `concatFilesAtPrefix` calls racing, no two can both observe the gate as
@@ -1130,12 +1159,15 @@ export class S3FileScanCat {
      * caller can abort (no counters are bumped on the fatal path).
      *
      * Releasing is done by `_getAndProcessObjectBody` / `_skipListedObjectOversizedForConcat`
-     * in their `finally` blocks.
+     * in their `finally` blocks. Callers that acquire inside `waitUntil` and may `break` before
+     * spawning those workers pass `acquiredOut`; on fatal after `waitUntil` resolves, they must
+     * call `_releaseBodySlotReservation` when `acquiredOut.reserved` is true.
      */
     private _tryAcquireBodySlot(
         concatState: ConcatState,
         prefix: string,
-        bumpWaits: () => number
+        bumpWaits: () => number,
+        acquiredOut?: { reserved: boolean }
     ): boolean {
         if (this._fatalScanError) {
             return true
@@ -1146,6 +1178,9 @@ export class S3FileScanCat {
         ) {
             concatState.bodiesInFlight++
             this._s3ObjectBodyProcessInProgress++
+            if (acquiredOut !== undefined) {
+                acquiredOut.reserved = true
+            }
             return true
         }
         if (bumpWaits() % 20 === 0) {
