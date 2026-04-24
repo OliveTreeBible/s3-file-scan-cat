@@ -40,6 +40,13 @@ export interface ScannerLimits {
      * Default 30 minutes. Use `Number.POSITIVE_INFINITY` to restore prior unbounded behavior.
      */
     waitUntilTimeoutMs?: number
+    /**
+     * `socketTimeout` (ms) on the S3 client's `NodeHttpHandler` — max idle time between socket
+     * read/write events before the request fails. Large `GetObject` bodies on slow links need a
+     * high value. Default **120_000** (2 minutes). The library previously hard-coded **5_000** ms,
+     * which was easy to trip on legitimate traffic.
+     */
+    requestSocketTimeoutMs?: number
 }
 
 export interface AWSConfig {

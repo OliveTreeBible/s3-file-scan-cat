@@ -114,6 +114,10 @@ export class S3FileScanCat {
             scannerOptions.limits?.waitUntilTimeoutMs !== undefined
                 ? scannerOptions.limits.waitUntilTimeoutMs
                 : 30 * 60 * 1000
+        const requestSocketTimeoutMs =
+            scannerOptions.limits?.requestSocketTimeoutMs !== undefined
+                ? scannerOptions.limits.requestSocketTimeoutMs
+                : 120_000
         this._scannerOptions = scannerOptions
         this._awsAccess = awsAccess
         // Build the keep-alive agents as named references so `close()` can destroy them later.
@@ -140,7 +144,7 @@ export class S3FileScanCat {
             requestHandler: new NodeHttpHandler({
                 httpsAgent: this._httpsAgent,
                 httpAgent: this._httpAgent,
-                socketTimeout: 5000,
+                socketTimeout: requestSocketTimeoutMs,
             }),
         })
     }
