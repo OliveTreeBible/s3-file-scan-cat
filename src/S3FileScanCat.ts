@@ -666,6 +666,18 @@ export class S3FileScanCat {
             const objectBodyStr = await response.Body.transformToString()
             this._s3ObjectsFetchedTotal++
 
+            if (objectBodyStr.length === 0) {
+                // The listing phase already filters out `Size === 0` entries (fix #19), so an
+                // empty body here means GetObject contradicted what ListObjectsV2 reported --
+                // usually a sign that the object was mutated or deleted between list and get,
+                // or that a producer wrote a size but no body. Surface it instead of silently
+                // dropping the record; the slot below will still advance via pendingBodies
+                // so downstream ordering is preserved.
+                void this._logger?.warn(
+                    `S3 GetObject returned an empty body for key=${s3Key} despite a positive listing Size; skipping append.`
+                )
+            }
+
             // Deposit the fetched body at its listing-order slot and drain every contiguous
             // slot that is ready. Empty bodies still occupy a slot so subsequent, non-empty
             // bodies can advance past them without the drain loop stalling. Holding the

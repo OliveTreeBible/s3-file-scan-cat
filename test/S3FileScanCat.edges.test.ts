@@ -691,6 +691,64 @@ describe('S3FileScanCat edges (mocked S3)', () => {
         )
     })
 
+    it('warns when GetObject returns an empty body despite a positive listing Size, and preserves ordering', async () => {
+        // Two keys with positive listing Size. The first one returns an empty body at GetObject
+        // time (a list/get inconsistency -- produces a listing Size > 0 but an empty payload).
+        // We expect: (1) a warn log identifying the key, (2) the empty slot doesn't stall the
+        // in-order drain from fix #8, and (3) the second key's body still lands in the output.
+        stubPartitionAndConcatList(() => ({
+            Contents: [
+                { Key: 'data/src/year=2020/ghost.json', Size: 8 },
+                { Key: 'data/src/year=2020/real.json', Size: 8 },
+            ],
+            IsTruncated: false,
+        }))
+        s3Mock.on(GetObjectCommand).callsFake((input) => {
+            if (input.Key?.includes('ghost.json')) {
+                return Promise.resolve({ Body: sdkStreamMixin(Readable.from([''])) })
+            }
+            return Promise.resolve({ Body: sdkStreamMixin(Readable.from(['{"real":true}'])) })
+        })
+        s3Mock.on(PutObjectCommand).resolves({})
+
+        const cat = new S3FileScanCat(
+            false,
+            scannerOptions({
+                partitionStack: ['year'],
+                loggerOptions: { level: 'warn' },
+            }),
+            testAwsSecrets
+        )
+        const logger = (cat as unknown as { _logger?: { warn: (...args: unknown[]) => unknown } })._logger
+        if (!logger) {
+            throw new Error('expected a logger to have been constructed for this test')
+        }
+        const warnSpy = vi.fn()
+        logger.warn = warnSpy
+
+        await cat.scanAndProcessFiles('bucket', 'data/src', 'data/dst')
+
+        // Both objects are counted as fetched (the raw metric is "did we call GetObject").
+        expect(cat.s3ObjectsFetchedTotal).toBe(2)
+        // The empty ghost is warned about with its key name and the "empty body" phrasing.
+        expect(
+            warnSpy.mock.calls.some((args) => {
+                const msg = String(args[0])
+                return (
+                    msg.includes('empty body') &&
+                    msg.includes('ghost.json') &&
+                    msg.includes('positive listing Size')
+                )
+            })
+        ).toBe(true)
+
+        // Exactly one output part is written, containing only the real record.
+        expect(cat.s3ObjectsPutTotal).toBe(1)
+        const put = s3Mock.commandCalls(PutObjectCommand)[0].args[0].input
+        const plain = gunzipSync(put.Body as Uint8Array).toString('utf8')
+        expect(plain).toBe('{"real":true}\n')
+    })
+
     it('warns and skips entries where Size is undefined but Key is present (not a hard error)', async () => {
         // A valid Key with Size undefined is the scenario that previously threw
         // "Invalid S3 Object encountered." despite nothing actually being invalid.
