@@ -57,9 +57,11 @@ export interface ScannerLimits {
      * `maxFileSizeBytes`) plus a `pendingBodies` map of unreleased source bodies. Peak
      * concat-buffer memory grows as `concatFilesAtPrefixProcessLimit × maxFileSizeBytes`.
      *
-     * Socket trade-off: combined with `s3ObjectBodyProcessTotalLimit` and
-     * `s3ObjectPutProcessLimit`, keep the sum comfortably below the S3 client's `maxSockets`
-     * (500) so list/get/put don't starve each other.
+     * Socket trade-off: concurrent `ListObjectsV2` in phase 1 is capped by
+     * `scanPrefixForPartitionsProcessLimit`; phase 2 can run one listing stream per in-flight leaf
+     * (`concatFilesAtPrefixProcessLimit`). Together with `s3ObjectBodyProcessTotalLimit` and
+     * `s3ObjectPutProcessLimit`, keep aggregate S3 concurrency comfortably below the client's
+     * `maxSockets` (500) so list/get/put don't starve each other.
      */
     concatFilesAtPrefixProcessLimit?: number
     /**
