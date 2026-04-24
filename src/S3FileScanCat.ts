@@ -1020,7 +1020,7 @@ export class S3FileScanCat {
     /**
      * Exponential backoff with equal jitter.
      *
-     * Returns a value in the range `[cap/2, cap]` where `cap = 2^retryCount * 100` ms, so:
+     * Returns an integer delay in ms in the closed range `[cap/2, cap]` where `cap = 2^retryCount * 100`, so:
      *  - retryCount=0  -> 50-100ms   (previously 0ms, which defeated backoff entirely)
      *  - retryCount=1  -> 100-200ms
      *  - retryCount=13 -> ~6.8-13.65 min (matches the prior documented upper bound)
@@ -1032,7 +1032,7 @@ export class S3FileScanCat {
     _getWaitTimeForRetry(retryCount: number): number {
         const cap = Math.pow(2, retryCount) * 100
         const half = cap / 2
-        return Math.floor(half + Math.random() * half)
+        return half + Math.floor(Math.random() * (half + 1))
     }
 
     /**

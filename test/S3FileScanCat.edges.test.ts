@@ -769,7 +769,7 @@ describe('S3FileScanCat edges (mocked S3)', () => {
     it('_getWaitTimeForRetry applies exponential backoff with equal jitter (no zero-ms first retry)', () => {
         const cat = new S3FileScanCat(false, scannerOptions({ partitionStack: ['year'] }), testAwsSecrets)
 
-        // Equal jitter: result ∈ [cap/2, cap], where cap = 2^retryCount * 100.
+        // Equal jitter: integer ms in [cap/2, cap], where cap = 2^retryCount * 100.
         // retryCount=0 -> [50, 100]; retryCount=1 -> [100, 200]; retryCount=5 -> [1600, 3200].
         for (const retry of [0, 1, 2, 5]) {
             const cap = Math.pow(2, retry) * 100
