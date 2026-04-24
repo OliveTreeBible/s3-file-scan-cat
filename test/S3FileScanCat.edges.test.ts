@@ -1,7 +1,13 @@
 import { Readable } from 'node:stream'
 import { gunzipSync } from 'node:zlib'
 
-import { GetObjectCommand, ListObjectsV2Command, PutObjectCommand, S3Client } from '@aws-sdk/client-s3'
+import {
+    GetObjectCommand,
+    type GetObjectCommandOutput,
+    ListObjectsV2Command,
+    PutObjectCommand,
+    S3Client,
+} from '@aws-sdk/client-s3'
 import { sdkStreamMixin } from '@smithy/util-stream'
 import { mockClient } from 'aws-sdk-client-mock'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
@@ -1366,6 +1372,40 @@ describe('S3FileScanCat edges (mocked S3)', () => {
             s3Mock.commandCalls(PutObjectCommand)[0].args[0].input.Body as Uint8Array
         ).toString('utf8')
         expect(plain).toBe('{"ok":true}\n')
+    })
+
+    it('skips transformToString when GetObject ContentLength exceeds maxSourceObjectSizeBytes (stale listing Size)', async () => {
+        stubPartitionAndConcatList(() => ({
+            Contents: [{ Key: 'data/src/year=2020/trap.json', Size: 8 }],
+            IsTruncated: false,
+        }))
+        s3Mock.on(GetObjectCommand).callsFake(
+            () =>
+                Promise.resolve({
+                    ContentLength: 50_000_000,
+                    Body: {
+                        transformToString: async () => {
+                            throw new Error(
+                                'transformToString must not run when ContentLength exceeds cap'
+                            )
+                        },
+                    },
+                } as GetObjectCommandOutput)
+        )
+        s3Mock.on(PutObjectCommand).resolves({})
+
+        const cat = new S3FileScanCat(
+            false,
+            scannerOptions({
+                partitionStack: ['year'],
+                limits: { maxSourceObjectSizeBytes: 1024 },
+            }),
+            testAwsSecrets
+        )
+        await cat.scanAndProcessFiles('bucket', 'data/src', 'data/dst')
+
+        expect(cat.s3ObjectsFetchedTotal).toBe(0)
+        expect(s3Mock.commandCalls(PutObjectCommand).length).toBe(0)
     })
 
     it('flushes before adding a body that would push the buffer over maxFileSizeBytes (including the newline)', async () => {

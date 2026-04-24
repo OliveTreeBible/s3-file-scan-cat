@@ -27,10 +27,11 @@ export interface ScannerLimits {
     s3ObjectBodyProcessInProgressLimit: number
     maxFileSizeBytes: number
     /**
-     * Skip `GetObject` when ListObjectsV2 reports `Size` greater than this (warn only).
-     * Prevents loading entire objects into memory via `transformToString()`. The listing-order
-     * slot is still advanced with an empty body so NDJSON ordering stays aligned with S3 keys.
-     * Defaults to `maxFileSizeBytes` when omitted.
+     * Skip loading the full object into memory when either ListObjectsV2 `Size` or (if present)
+     * GetObject `ContentLength` exceeds this value (warn only). Guards `transformToString()` when
+     * listing metadata is stale. The listing-order slot is still advanced with an empty body.
+     * Defaults to `maxFileSizeBytes` when omitted. If GetObject omits `ContentLength`, only the
+     * listing check applies before read.
      */
     maxSourceObjectSizeBytes?: number
     /**
@@ -148,8 +149,9 @@ export interface S3FileScanCatStats {
     /**
      * Count of source objects whose `GetObject` body was fully read into memory (`transformToString`
      * completed) this run. Includes reads whose payload was empty (list/get mismatch); does **not**
-     * include keys skipped at list time (e.g. zero size, over `maxSourceObjectSizeBytes`) or keys
-     * never fetched due to a fatal error before read.
+     * include keys skipped at list time (e.g. zero size, over `maxSourceObjectSizeBytes`), objects
+     * skipped after GetObject when `ContentLength` exceeds the cap, or keys never read due to fatal
+     * error before `transformToString()`.
      */
     s3ObjectsFetchedTotal: number
     /**

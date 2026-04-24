@@ -872,6 +872,25 @@ export class S3FileScanCat {
             } else if (!response.Body) {
                 throw new Error(`[ERROR]: Missing response data for object ${s3Key}`)
             }
+            // When S3 includes ContentLength, honor maxSourceObjectSizeBytes again before buffering
+            // the whole body — listing Size can be stale or wrong (#3).
+            const contentLength = response.ContentLength
+            if (typeof contentLength === 'number' && contentLength > this._maxSourceObjectSizeBytes) {
+                void this._logger?.warn(
+                    `Skipping GetObject body read: ContentLength (${contentLength}) exceeds maxSourceObjectSizeBytes (${this._maxSourceObjectSizeBytes}) for key=${s3Key} (listing Size may be stale). Preserving ordering with an empty slot.`
+                )
+                await this._depositListingOrderBodyFromString(
+                    bucket,
+                    concatState,
+                    prefix,
+                    srcPrefix,
+                    destPrefix,
+                    seq,
+                    '',
+                    s3Key
+                )
+                return
+            }
             const objectBodyStr = await response.Body.transformToString()
             this._s3ObjectsFetchedTotal++
 
