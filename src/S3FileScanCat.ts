@@ -25,6 +25,18 @@ import { waitUntil } from './waitUntil'
 const MS_PER_DAY = 24 * 60 * 60 * 1000
 const MAX_LIST_KEYS = 1000
 
+/** Readable detail for `Error` messages; avoids `[object Object]` on non-Error throws. */
+function describeUnknownError(value: unknown): string {
+    if (value instanceof Error) {
+        return value.message
+    }
+    try {
+        return JSON.stringify(value)
+    } catch {
+        return String(value)
+    }
+}
+
 export class S3FileScanCat {
     private _logger?: Logger
     /** S3 path separator. Immutable; constant across the lifetime of the instance. */
@@ -870,11 +882,11 @@ export class S3FileScanCat {
                 `STATUS _getObjectBody s3Key=${s3Key} - _s3ObjectBodyProcessCount: ${this._s3ObjectBodyProcessInProgress}`
             )
             if (response === undefined) {
-                throw new Error(
-                    `[ERROR]: Unexpected S3 getObject error encountered ${s3Key}:${lastError ? lastError : ''}`
-                )
+                const detail =
+                    lastError === undefined ? 'no error details captured' : describeUnknownError(lastError)
+                throw new Error(`Unexpected S3 GetObject failure for key=${s3Key}: ${detail}`)
             } else if (!response.Body) {
-                throw new Error(`[ERROR]: Missing response data for object ${s3Key}`)
+                throw new Error(`Missing response data for object ${s3Key}`)
             }
             // When S3 includes ContentLength, honor maxSourceObjectSizeBytes again before buffering
             // the whole body — listing Size can be stale or wrong (#3).

@@ -727,7 +727,7 @@ describe('S3FileScanCat edges (mocked S3)', () => {
         const sleepSpy = vi.spyOn(cat, '_sleep').mockResolvedValue(undefined)
 
         await expect(cat.scanAndProcessFiles('bucket', 'data/src', 'data/dst')).rejects.toThrow(
-            /Unexpected S3 getObject error/
+            /Unexpected S3 GetObject failure for key=.*Access Denied/s
         )
 
         // One attempt, no retries, no sleeps.
@@ -848,7 +848,7 @@ describe('S3FileScanCat edges (mocked S3)', () => {
                 'data/dst',
                 0
             )
-        ).rejects.toThrow(/Unexpected S3 getObject error/)
+        ).rejects.toThrow(/Unexpected S3 GetObject failure for key=.*permanent failure/s)
     })
 
     it('throws when GetObject returns no Body (_getAndProcessObjectBody)', async () => {
