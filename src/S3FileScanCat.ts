@@ -363,7 +363,9 @@ export class S3FileScanCat {
                         ) {
                             return true
                         } else if (waits++ % 20 === 0) {
-                            void this._logger?.debug(`Waiting on ListObjects to complete prefix=${srcPrefix} `)
+                            void this._logger?.debug(
+                                `Waiting until a partition-scan worker slot is free (srcPrefix=${srcPrefix}, inFlight=${this._scanPrefixForPartitionsProcessCount}, limit=${this._scannerOptions.limits.scanPrefixForPartitionsProcessLimit})`
+                            )
                         }
                     },
                     { timeout: this._waitUntilTimeoutMs }
@@ -521,7 +523,7 @@ export class S3FileScanCat {
                                         return true
                                     } else if (waits++ % 20 === 0) {
                                         void this._logger?.trace(
-                                            `Waiting on ListObjects to complete prefix=${srcPrefix} `
+                                            `Waiting until GetObject body workers drop below limit (leafPrefix=${prefix}, inFlight=${concatState.bodiesInFlight}, limit=${this._s3ObjectBodyProcessInProgressLimit})`
                                         )
                                     }
                                 },
