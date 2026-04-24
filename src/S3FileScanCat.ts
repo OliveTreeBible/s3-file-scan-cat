@@ -1025,7 +1025,19 @@ export class S3FileScanCat {
                         } else if (prefixEval.keyParams) {
                             this._keyParams.push(prefixEval.keyParams)
                         } else {
-                            throw new Error(`Unexpected partition info encountered. ${JSON.stringify(keyParams)}`)
+                            const lastSeg = commonPrefix.Prefix
+                                ? this._lastSegmentOfListPrefix(commonPrefix.Prefix)
+                                : undefined
+                            if (
+                                lastSeg !== undefined &&
+                                !this._pathSegmentMatchesPartitionCurPart(lastSeg, curPart)
+                            ) {
+                                void this._logger?.warn(
+                                    `Skipping CommonPrefix that does not match partition dimension '${curPart}': ${commonPrefix.Prefix}`
+                                )
+                            } else {
+                                throw new Error(`Unexpected partition info encountered. ${JSON.stringify(keyParams)}`)
+                            }
                         }
                     })
                 } else if (response.Contents && response.Contents.length > 0) {
@@ -1039,28 +1051,52 @@ export class S3FileScanCat {
         }
     }
 
+    /**
+     * Final path segment before the trailing delimiter in a list-style prefix
+     * (e.g. `data/src/year=2020/` → `year=2020`).
+     */
+    _lastSegmentOfListPrefix(prefixKey: string): string | undefined {
+        const parts = prefixKey.split(this._delimiter)
+        if (parts.length <= 1) {
+            return undefined
+        }
+        return parts[parts.length - 2]
+    }
+
+    /**
+     * True when `segment` is this partition level's directory name for `curPart`.
+     * Uses Hive-style `name=value` boundaries so `year` does not match `yearly=…`
+     * (substring false positives from the old `startsWith(curPart)` check).
+     */
+    _pathSegmentMatchesPartitionCurPart(segment: string, curPart: string): boolean {
+        const dimension = curPart.replace(/=+$/, '').trim()
+        if (dimension.length === 0) {
+            return false
+        }
+        return segment === dimension || segment.startsWith(`${dimension}=`)
+    }
+
     _evaluatePrefix(keyParams: PrefixParams, commonPrefix: CommonPrefix, curPart: string): PrefixEvalResult {
         void this._logger?.trace(`_keysForPrefix ${keyParams.curPrefix}`)
         const result: PrefixEvalResult = {}
-        if (commonPrefix.Prefix) {
-            const parts = commonPrefix.Prefix.split(this._delimiter)
-            if (parts.length > 1) {
-                const lastPart = parts[parts.length - 2]
-                if (lastPart.startsWith(curPart)) {
-                    const nextPart = `${keyParams.curPrefix}${lastPart}`
-                    if (keyParams.partitionStack.length > 0) {
-                        const partitionStackClone = Object.assign([], keyParams.partitionStack)
-                        result.keyParams = {
-                            bucket: keyParams.bucket,
-                            prefix: keyParams.prefix,
-                            curPrefix: nextPart,
-                            partitionStack: partitionStackClone,
-                        }
-                    } else {
-                        result.partition = nextPart
-                    }
-                }
+        if (!commonPrefix.Prefix) {
+            return result
+        }
+        const lastPart = this._lastSegmentOfListPrefix(commonPrefix.Prefix)
+        if (lastPart === undefined || !this._pathSegmentMatchesPartitionCurPart(lastPart, curPart)) {
+            return result
+        }
+        const nextPart = `${keyParams.curPrefix}${lastPart}`
+        if (keyParams.partitionStack.length > 0) {
+            const partitionStackClone = Object.assign([], keyParams.partitionStack)
+            result.keyParams = {
+                bucket: keyParams.bucket,
+                prefix: keyParams.prefix,
+                curPrefix: nextPart,
+                partitionStack: partitionStackClone,
             }
+        } else {
+            result.partition = nextPart
         }
         return result
     }

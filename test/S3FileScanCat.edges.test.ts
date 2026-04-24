@@ -389,6 +389,76 @@ describe('S3FileScanCat edges (mocked S3)', () => {
         expect(cat.getStats().isClosed).toBe(true)
     })
 
+    it('_pathSegmentMatchesPartitionCurPart uses Hive name=value boundaries (no substring false positives)', () => {
+        const cat = new S3FileScanCat(false, scannerOptions({ partitionStack: ['year'] }), testAwsSecrets)
+
+        expect(cat._pathSegmentMatchesPartitionCurPart('year=2020', 'year')).toBe(true)
+        expect(cat._pathSegmentMatchesPartitionCurPart('year=2020', 'year=')).toBe(true)
+        expect(cat._pathSegmentMatchesPartitionCurPart('year', 'year')).toBe(true)
+        expect(cat._pathSegmentMatchesPartitionCurPart('yearly=1', 'year')).toBe(false)
+        expect(cat._pathSegmentMatchesPartitionCurPart('year_backup=1', 'year')).toBe(false)
+        expect(cat._pathSegmentMatchesPartitionCurPart('part-04=00', 'part-04')).toBe(true)
+        expect(cat._pathSegmentMatchesPartitionCurPart('part-040=00', 'part-04')).toBe(false)
+    })
+
+    it('_lastSegmentOfListPrefix returns the segment before the trailing slash', () => {
+        const cat = new S3FileScanCat(false, scannerOptions({ partitionStack: ['year'] }), testAwsSecrets)
+        expect(cat._lastSegmentOfListPrefix('data/src/year=2020/')).toBe('year=2020')
+        expect(cat._lastSegmentOfListPrefix('year=2020')).toBeUndefined()
+    })
+
+    it('skips CommonPrefixes that only falsely matched via substring (e.g. yearly= when curPart is year)', async () => {
+        s3Mock.on(ListObjectsV2Command).callsFake((input) => {
+            if (input.Delimiter === '/') {
+                if (input.Prefix === 'data/src/' || input.Prefix === 'data/src') {
+                    return Promise.resolve({
+                        CommonPrefixes: [
+                            { Prefix: 'data/src/year=2020/' },
+                            { Prefix: 'data/src/yearly=1/' },
+                        ],
+                        IsTruncated: false,
+                    })
+                }
+                throw new Error(`Unexpected partition list Prefix=${input.Prefix}`)
+            }
+            return Promise.resolve({
+                Contents: [{ Key: `${input.Prefix}one.json`, Size: 8 }],
+                IsTruncated: false,
+            })
+        })
+        s3Mock.on(GetObjectCommand).callsFake(() =>
+            Promise.resolve({
+                Body: sdkStreamMixin(Readable.from(['{"k":1}'])),
+            })
+        )
+        s3Mock.on(PutObjectCommand).resolves({})
+
+        const warnSpy = vi.fn()
+        const cat = new S3FileScanCat(
+            false,
+            scannerOptions({
+                partitionStack: ['year'],
+                loggerOptions: { level: 'warn' },
+            }),
+            testAwsSecrets
+        )
+        const logger = (cat as unknown as { _logger?: { warn: (...args: unknown[]) => unknown } })._logger
+        if (logger) {
+            logger.warn = warnSpy
+        }
+
+        await cat.scanAndProcessFiles('bucket', 'data/src', 'data/dst')
+
+        expect(cat.prefixesProcessedTotal).toBe(1)
+        expect(
+            warnSpy.mock.calls.some((args) =>
+                String(args[0]).includes('Skipping CommonPrefix') && String(args[0]).includes('yearly=1')
+            )
+        ).toBe(true)
+        const putKeys = s3Mock.commandCalls(PutObjectCommand).map((c) => c.args[0].input.Key)
+        expect(putKeys).toEqual(['data/dst/year=2020/0.json.gz'])
+    })
+
     it('_buildDestinationKey handles trailing-slash variants, mismatched paths, and deep leaves', () => {
         const cat = new S3FileScanCat(false, scannerOptions({ partitionStack: ['year'] }), testAwsSecrets)
 
