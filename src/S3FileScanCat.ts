@@ -61,6 +61,8 @@ export class S3FileScanCat {
     private _isClosed: boolean = false
     private _s3ObjectBodyProcessInProgressLimit: number
     private _maxFileSizeBytes: number
+    /** Upper bound on listing `Size` before we will issue GetObject (defaults to maxFileSizeBytes). */
+    private _maxSourceObjectSizeBytes: number
     /** Passed to every `waitUntil` in this class so stuck predicates cannot spin forever. */
     private _waitUntilTimeoutMs: number
     private _scannerOptions: ScannerOptions
@@ -102,6 +104,10 @@ export class S3FileScanCat {
             scannerOptions.limits?.maxFileSizeBytes !== undefined
                 ? scannerOptions.limits?.maxFileSizeBytes
                 : 128 * 1024 * 1024
+        this._maxSourceObjectSizeBytes =
+            scannerOptions.limits?.maxSourceObjectSizeBytes !== undefined
+                ? scannerOptions.limits.maxSourceObjectSizeBytes
+                : this._maxFileSizeBytes
         this._waitUntilTimeoutMs =
             scannerOptions.limits?.waitUntilTimeoutMs !== undefined
                 ? scannerOptions.limits.waitUntilTimeoutMs
@@ -517,6 +523,54 @@ export class S3FileScanCat {
                                 )
                                 continue
                             }
+                            if (s3Object.Size > this._maxSourceObjectSizeBytes) {
+                                void this._logger?.warn(
+                                    `Skipping GetObject: listing Size (${s3Object.Size}) exceeds maxSourceObjectSizeBytes (${this._maxSourceObjectSizeBytes}) for key=${s3Object.Key}; preserving ordering with an empty slot.`
+                                )
+                                await waitUntil(
+                                    () => {
+                                        if (this._fatalScanError) {
+                                            return true
+                                        }
+                                        if (
+                                            concatState.bodiesInFlight <
+                                            this._s3ObjectBodyProcessInProgressLimit
+                                        ) {
+                                            return true
+                                        } else if (waits++ % 20 === 0) {
+                                            void this._logger?.trace(
+                                                `Waiting until GetObject body workers drop below limit (leafPrefix=${prefix}, inFlight=${concatState.bodiesInFlight}, limit=${this._s3ObjectBodyProcessInProgressLimit})`
+                                            )
+                                        }
+                                    },
+                                    { timeout: this._waitUntilTimeoutMs }
+                                )
+                                if (this._fatalScanError) {
+                                    break
+                                }
+                                const seq = nextSeq++
+                                const objectKey = s3Object.Key
+                                const skipPromise: Promise<void> = this._skipListedObjectOversizedForConcat(
+                                    bucket,
+                                    concatState,
+                                    prefix,
+                                    srcPrefix,
+                                    destPrefix,
+                                    seq,
+                                    objectKey
+                                )
+                                    .catch((err: unknown) => {
+                                        void this._logger?.error(
+                                            `skipListedObjectOversized failed for key=${objectKey}: ${err instanceof Error ? err.message : String(err)}`
+                                        )
+                                        this._setFatalScanError(err)
+                                    })
+                                    .finally(() => {
+                                        inFlightBodies.delete(skipPromise)
+                                    })
+                                inFlightBodies.add(skipPromise)
+                                continue
+                            }
                             await waitUntil(
                                 () => {
                                     if (this._fatalScanError) {
@@ -624,6 +678,105 @@ export class S3FileScanCat {
         }
     }
 
+    /**
+     * Place `objectBodyStr` at `seq` and drain contiguous pending slots into the concat buffer.
+     * Used after GetObject and for oversized listing skips (empty string preserves ordering).
+     */
+    private async _depositListingOrderBodyFromString(
+        bucket: string,
+        concatState: ConcatState,
+        prefix: string,
+        srcPrefix: string,
+        destPrefix: string,
+        seq: number,
+        objectBodyStr: string,
+        s3Key: string
+    ): Promise<void> {
+        const unlockBuf = await this._acquireConcatBufferLock(concatState)
+        try {
+            concatState.pendingBodies.set(seq, objectBodyStr)
+            while (concatState.pendingBodies.has(concatState.nextSeqToAppend)) {
+                const rawBody = concatState.pendingBodies.get(concatState.nextSeqToAppend) as string
+                concatState.pendingBodies.delete(concatState.nextSeqToAppend)
+                concatState.nextSeqToAppend++
+                if (rawBody.length === 0) {
+                    continue
+                }
+                const bodyWithNl = rawBody.endsWith('\n') ? rawBody : `${rawBody}\n`
+                const addSize = bodyWithNl.length
+                if (addSize > this._maxFileSizeBytes) {
+                    void this._logger?.warn(
+                        `Source object body (${rawBody.length} bytes, key=${s3Key}) exceeds maxFileSizeBytes (${this._maxFileSizeBytes}); emitting as a single oversized output part.`
+                    )
+                }
+                if (
+                    concatState.buffer &&
+                    concatState.buffer.length + addSize > this._maxFileSizeBytes
+                ) {
+                    const bufferToFlush = concatState.buffer
+                    const flushFileNumber = concatState.fileNumber++
+                    concatState.buffer = undefined
+                    const flushPromise: Promise<void> = this._flushBuffer(
+                        bucket,
+                        bufferToFlush,
+                        prefix,
+                        srcPrefix,
+                        destPrefix,
+                        flushFileNumber
+                    )
+                        .catch((err: unknown) => {
+                            void this._logger?.error(
+                                `Flush failed for prefix=${prefix} fileNumber=${flushFileNumber}: ${err instanceof Error ? err.message : String(err)}`
+                            )
+                            this._setFatalScanError(err)
+                        })
+                        .finally(() => {
+                            concatState.inFlightFlushes.delete(flushPromise)
+                        })
+                    concatState.inFlightFlushes.add(flushPromise)
+                }
+                concatState.buffer = (concatState.buffer ?? '') + bodyWithNl
+            }
+        } finally {
+            unlockBuf()
+        }
+    }
+
+    /**
+     * Same bodiesInFlight / class rollup as `_getAndProcessObjectBody` without issuing GetObject
+     * when listing Size exceeds `maxSourceObjectSizeBytes` (memory bound).
+     */
+    private async _skipListedObjectOversizedForConcat(
+        bucket: string,
+        concatState: ConcatState,
+        prefix: string,
+        srcPrefix: string,
+        destPrefix: string,
+        seq: number,
+        s3Key: string
+    ): Promise<void> {
+        concatState.bodiesInFlight++
+        this._s3ObjectBodyProcessInProgress++
+        try {
+            if (this._fatalScanError) {
+                return
+            }
+            await this._depositListingOrderBodyFromString(
+                bucket,
+                concatState,
+                prefix,
+                srcPrefix,
+                destPrefix,
+                seq,
+                '',
+                s3Key
+            )
+        } finally {
+            concatState.bodiesInFlight--
+            this._s3ObjectBodyProcessInProgress--
+        }
+    }
+
     async _getAndProcessObjectBody(
         bucket: string,
         s3Key: string,
@@ -716,73 +869,16 @@ export class S3FileScanCat {
                 )
             }
 
-            // Deposit the fetched body at its listing-order slot and drain every contiguous
-            // slot that is ready. Empty bodies still occupy a slot so subsequent, non-empty
-            // bodies can advance past them without the drain loop stalling. Holding the
-            // mutex across the optional flush call is deliberate: it keeps buffer/flush
-            // interleavings serialized. Performance of that trade-off is tracked separately.
-            const unlockBuf = await this._acquireConcatBufferLock(concatState)
-            try {
-                concatState.pendingBodies.set(seq, objectBodyStr)
-                while (concatState.pendingBodies.has(concatState.nextSeqToAppend)) {
-                    const rawBody = concatState.pendingBodies.get(concatState.nextSeqToAppend) as string
-                    concatState.pendingBodies.delete(concatState.nextSeqToAppend)
-                    concatState.nextSeqToAppend++
-                    if (rawBody.length === 0) {
-                        continue
-                    }
-                    // Normalize each source body to end with exactly one '\n' so that:
-                    //   - the last record of every output part is terminated (cross-part
-                    //     concatenation yields valid NDJSON);
-                    //   - there is always exactly one newline between adjacent bodies,
-                    //     independent of whether the source happened to end with one.
-                    const bodyWithNl = rawBody.endsWith('\n') ? rawBody : `${rawBody}\n`
-                    // Use the normalized length for the size check so the cap is honored
-                    // including the separator/terminator (previously ignored, allowing
-                    // overflow of up to N-1 bytes).
-                    const addSize = bodyWithNl.length
-                    if (addSize > this._maxFileSizeBytes) {
-                        void this._logger?.warn(
-                            `Source object body (${rawBody.length} bytes, key=${s3Key}) exceeds maxFileSizeBytes (${this._maxFileSizeBytes}); emitting as a single oversized output part.`
-                        )
-                    }
-                    if (
-                        concatState.buffer &&
-                        concatState.buffer.length + addSize > this._maxFileSizeBytes
-                    ) {
-                        // Detach the flush so the buffer mutex is not held across gzip+PutObject.
-                        // Under the mutex we only snapshot the buffer and increment fileNumber;
-                        // the expensive async work runs outside the critical section so other
-                        // body workers are not blocked for the duration of the round trip.
-                        // The resulting promise is tracked on `concatState.inFlightFlushes` and
-                        // awaited in concatFilesAtPrefix's finally block.
-                        const bufferToFlush = concatState.buffer
-                        const flushFileNumber = concatState.fileNumber++
-                        concatState.buffer = undefined
-                        const flushPromise: Promise<void> = this._flushBuffer(
-                            bucket,
-                            bufferToFlush,
-                            prefix,
-                            srcPrefix,
-                            destPrefix,
-                            flushFileNumber
-                        )
-                            .catch((err: unknown) => {
-                                void this._logger?.error(
-                                    `Flush failed for prefix=${prefix} fileNumber=${flushFileNumber}: ${err instanceof Error ? err.message : String(err)}`
-                                )
-                                this._setFatalScanError(err)
-                            })
-                            .finally(() => {
-                                concatState.inFlightFlushes.delete(flushPromise)
-                            })
-                        concatState.inFlightFlushes.add(flushPromise)
-                    }
-                    concatState.buffer = (concatState.buffer ?? '') + bodyWithNl
-                }
-            } finally {
-                unlockBuf()
-            }
+            await this._depositListingOrderBodyFromString(
+                bucket,
+                concatState,
+                prefix,
+                srcPrefix,
+                destPrefix,
+                seq,
+                objectBodyStr,
+                s3Key
+            )
         } finally {
             concatState.bodiesInFlight--
             this._s3ObjectBodyProcessInProgress--

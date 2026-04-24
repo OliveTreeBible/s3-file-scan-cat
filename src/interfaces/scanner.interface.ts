@@ -27,6 +27,13 @@ export interface ScannerLimits {
     s3ObjectBodyProcessInProgressLimit: number
     maxFileSizeBytes: number
     /**
+     * Skip `GetObject` when ListObjectsV2 reports `Size` greater than this (warn only).
+     * Prevents loading entire objects into memory via `transformToString()`. The listing-order
+     * slot is still advanced with an empty body so NDJSON ordering stays aligned with S3 keys.
+     * Defaults to `maxFileSizeBytes` when omitted.
+     */
+    maxSourceObjectSizeBytes?: number
+    /**
      * Max time (ms) inner `waitUntil` loops may wait before throwing `waitUntil timed out`.
      * Prevents hangs if backpressure counters never clear (misconfiguration or bugs).
      * Default 30 minutes. Use `Number.POSITIVE_INFINITY` to restore prior unbounded behavior.

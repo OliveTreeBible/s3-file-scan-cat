@@ -218,7 +218,11 @@ describe('S3FileScanCat edges (mocked S3)', () => {
             false,
             scannerOptions({
                 partitionStack: ['year'],
-                limits: { maxFileSizeBytes: 5 },
+                limits: {
+                    maxFileSizeBytes: 5,
+                    // Listing Size is 10 per key; default maxSource would equal maxFile (5) and skip fetch.
+                    maxSourceObjectSizeBytes: 32,
+                },
             }),
             testAwsSecrets
         )
@@ -1253,7 +1257,11 @@ describe('S3FileScanCat edges (mocked S3)', () => {
             false,
             scannerOptions({
                 partitionStack: ['year'],
-                limits: { maxFileSizeBytes: 16 },
+                limits: {
+                    maxFileSizeBytes: 16,
+                    // Allow GetObject for the 128-byte body; default maxSource would match maxFile and skip fetch.
+                    maxSourceObjectSizeBytes: 256,
+                },
                 loggerOptions: { level: 'warn' },
             }),
             testAwsSecrets
@@ -1276,6 +1284,42 @@ describe('S3FileScanCat edges (mocked S3)', () => {
                 String(args[0]).includes('exceeds maxFileSizeBytes')
             )
         ).toBe(true)
+    })
+
+    it('skips GetObject when listing Size exceeds maxSourceObjectSizeBytes but preserves key order', async () => {
+        stubPartitionAndConcatList(() => ({
+            Contents: [
+                { Key: 'data/src/year=2020/huge.json', Size: 10_000_000 },
+                { Key: 'data/src/year=2020/small.json', Size: 12 },
+            ],
+            IsTruncated: false,
+        }))
+        s3Mock.on(GetObjectCommand).callsFake((input) => {
+            if (input.Key?.includes('huge')) {
+                throw new Error('huge.json must not be fetched')
+            }
+            return Promise.resolve({
+                Body: sdkStreamMixin(Readable.from(['{"ok":true}'])),
+            })
+        })
+        s3Mock.on(PutObjectCommand).resolves({})
+
+        const cat = new S3FileScanCat(
+            false,
+            scannerOptions({
+                partitionStack: ['year'],
+                limits: { maxSourceObjectSizeBytes: 1024 },
+            }),
+            testAwsSecrets
+        )
+        await cat.scanAndProcessFiles('bucket', 'data/src', 'data/dst')
+
+        expect(s3Mock.commandCalls(GetObjectCommand).length).toBe(1)
+        expect(cat.s3ObjectsFetchedTotal).toBe(1)
+        const plain = gunzipSync(
+            s3Mock.commandCalls(PutObjectCommand)[0].args[0].input.Body as Uint8Array
+        ).toString('utf8')
+        expect(plain).toBe('{"ok":true}\n')
     })
 
     it('flushes before adding a body that would push the buffer over maxFileSizeBytes (including the newline)', async () => {
