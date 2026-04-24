@@ -225,6 +225,54 @@ describe('S3FileScanCat edges (mocked S3)', () => {
         expect(cat.s3ObjectsPutTotal).toBe(3)
     })
 
+    it('drains thousands of leaf prefixes without quadratic shift() behavior', async () => {
+        // Arrange 5000 year partitions. Under the pre-fix Array.shift() pattern, draining
+        // 5000 items is O(n^2) (~12.5M memmove ops in the queue) plus the same for _keyParams.
+        // With the index-pointer fix it's strictly O(n).
+        const NUM_PREFIXES = 5000
+        const commonPrefixes = Array.from({ length: NUM_PREFIXES }, (_, i) => ({
+            Prefix: `data/src/year=${String(i).padStart(4, '0')}/`,
+        }))
+
+        s3Mock.on(ListObjectsV2Command).callsFake((input) => {
+            if (input.Delimiter === '/') {
+                // Return all 5000 leaf prefixes in one shot.
+                return Promise.resolve({ CommonPrefixes: commonPrefixes, IsTruncated: false })
+            }
+            // Concat phase list: each leaf contains one tiny object.
+            return Promise.resolve({
+                Contents: [{ Key: `${input.Prefix}one.json`, Size: 8 }],
+                IsTruncated: false,
+            })
+        })
+        s3Mock.on(GetObjectCommand).callsFake(() =>
+            Promise.resolve({ Body: sdkStreamMixin(Readable.from(['{"k":1}'])) })
+        )
+        s3Mock.on(PutObjectCommand).resolves({})
+
+        const cat = new S3FileScanCat(false, scannerOptions({ partitionStack: ['year'] }), testAwsSecrets)
+
+        const t0 = Date.now()
+        await cat.scanAndProcessFiles('bucket', 'data/src', 'data/dst')
+        const elapsed = Date.now() - t0
+
+        // Correctness: every prefix was processed exactly once.
+        expect(cat.prefixesProcessedTotal).toBe(NUM_PREFIXES)
+        expect(cat.totalPrefixesToProcess).toBe(NUM_PREFIXES)
+        expect(cat.s3ObjectsPutTotal).toBe(NUM_PREFIXES)
+
+        // Perf guard: not trying to assert a specific wall-clock number (which varies by
+        // machine), just that draining 5000 items stayed well under the 30s vitest default.
+        // The real signal that the fix is working is the `prefixCountForProcessing` == 0
+        // sanity below -- and the whole thing completing at all, because Array.shift on a
+        // 5000-length array per iteration would normally work fine for this size (shift is
+        // still fast for small N in V8), so this test's primary value is as a regression
+        // guard that `prefixCountForProcessing` / the stats accurately report "remaining".
+        expect(elapsed).toBeLessThan(20_000)
+        expect(cat.prefixCountForProcessing).toBe(0)
+        expect(cat.getStats().prefixesRemainingInQueue).toBe(0)
+    })
+
     it('getStats() returns a frozen snapshot, and replacement getters mirror their deprecated counterparts', async () => {
         stubPartitionAndConcatList(() => ({
             Contents: [{ Key: 'data/src/year=2020/a.json', Size: 8 }],

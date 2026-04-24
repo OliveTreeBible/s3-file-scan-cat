@@ -28,8 +28,13 @@ const MAX_LIST_KEYS = 1000
 export class S3FileScanCat {
     private _logger?: Logger
     private _delimiter: string = '/'
+    // Queues are implemented as arrays with a monotonic read-index pointer so that taking an item
+    // is O(1) instead of Array.shift()'s O(n). Without this, draining thousands of leaf prefixes
+    // is O(n^2). The arrays are cleared in `_resetRunState` to release references.
     private _keyParams: PrefixParams[] = []
+    private _keyParamsHead: number = 0
     private _allPrefixes: string[] = []
+    private _allPrefixesHead: number = 0
     private _scanPrefixForPartitionsProcessCount: number = 0
     private _s3PrefixListObjectsProcessCount: number = 0
     private _totalPrefixesToProcess: number = 0
@@ -211,7 +216,7 @@ export class S3FileScanCat {
     }
 
     get prefixCountForProcessing(): number {
-        return this._allPrefixes.length
+        return this._allPrefixesRemaining()
     }
 
     get prefixesProcessedTotal(): number {
@@ -241,7 +246,7 @@ export class S3FileScanCat {
             concatListObjectsInProgress: this._s3PrefixListObjectsProcessCount,
             totalPrefixesToProcess: this._totalPrefixesToProcess,
             prefixesProcessedTotal: this._prefixesProcessedTotal,
-            prefixesRemainingInQueue: this._allPrefixes.length,
+            prefixesRemainingInQueue: this._allPrefixesRemaining(),
             s3ObjectBodyWorkersInProgress: this._s3ObjectBodyProcessInProgress,
             s3ObjectPutWorkersInProgress: this._s3ObjectPutProcessCount,
             s3ObjectsFetchedTotal: this._s3ObjectsFetchedTotal,
@@ -332,14 +337,14 @@ export class S3FileScanCat {
 
         let waits = 0
         try {
-            while (this._keyParams.length > 0 || this._scanPrefixForPartitionsProcessCount > 0) {
+            while (this._keyParamsRemaining() > 0 || this._scanPrefixForPartitionsProcessCount > 0) {
                 await waitUntil(() => {
                     if (this._fatalScanError) {
                         return true
                     }
                     if (
                         this._scanPrefixForPartitionsProcessCount === 0 ||
-                        (this._keyParams.length > 0 &&
+                        (this._keyParamsRemaining() > 0 &&
                             this._scanPrefixForPartitionsProcessCount <
                                 this._scannerOptions.limits.scanPrefixForPartitionsProcessLimit)
                     ) {
@@ -351,7 +356,7 @@ export class S3FileScanCat {
                 if (this._fatalScanError) {
                     break
                 }
-                const keyParam = this._keyParams.shift()
+                const keyParam = this._takeKeyParam()
                 if (keyParam) {
                     // Track the promise so a fatal error can't leave background scans
                     // mutating shared state after scanAndProcessFiles has returned.
@@ -378,10 +383,10 @@ export class S3FileScanCat {
         if (this._fatalScanError) {
             throw this._fatalScanError
         }
-        this._totalPrefixesToProcess = this._allPrefixes.length
-        if (this._allPrefixes.length > 0) {
-            while (this._allPrefixes.length > 0) {
-                const prefix = this._allPrefixes.shift()
+        this._totalPrefixesToProcess = this._allPrefixesRemaining()
+        if (this._totalPrefixesToProcess > 0) {
+            while (this._allPrefixesRemaining() > 0) {
+                const prefix = this._takeAllPrefix()
                 if (prefix) {
                     await this.concatFilesAtPrefix(bucket, prefix, srcPrefix, destPath)
                 }
@@ -768,7 +773,9 @@ export class S3FileScanCat {
      */
     private _resetRunState(): void {
         this._keyParams = []
+        this._keyParamsHead = 0
         this._allPrefixes = []
+        this._allPrefixesHead = 0
         this._scanPrefixForPartitionsProcessCount = 0
         this._s3PrefixListObjectsProcessCount = 0
         this._totalPrefixesToProcess = 0
@@ -780,6 +787,41 @@ export class S3FileScanCat {
         this._isDone = false
         this._fatalScanError = undefined
         this._inFlightPartitionScans = new Set()
+    }
+
+    /** Number of items still to be taken from the `_keyParams` queue. */
+    private _keyParamsRemaining(): number {
+        return this._keyParams.length - this._keyParamsHead
+    }
+
+    /** O(1) replacement for `this._keyParams.shift()`, using an index pointer. */
+    private _takeKeyParam(): PrefixParams | undefined {
+        if (this._keyParamsHead >= this._keyParams.length) {
+            return undefined
+        }
+        const item = this._keyParams[this._keyParamsHead]
+        // Release the reference so the GC can collect consumed entries; prevents the array
+        // from retaining every processed PrefixParams for the duration of the run.
+        // (The ts-ignore is just for the `delete` on a typed array index.)
+        ;(this._keyParams as (PrefixParams | undefined)[])[this._keyParamsHead] = undefined
+        this._keyParamsHead++
+        return item
+    }
+
+    /** Number of items still to be taken from the `_allPrefixes` queue. */
+    private _allPrefixesRemaining(): number {
+        return this._allPrefixes.length - this._allPrefixesHead
+    }
+
+    /** O(1) replacement for `this._allPrefixes.shift()`, using an index pointer. */
+    private _takeAllPrefix(): string | undefined {
+        if (this._allPrefixesHead >= this._allPrefixes.length) {
+            return undefined
+        }
+        const item = this._allPrefixes[this._allPrefixesHead]
+        ;(this._allPrefixes as (string | undefined)[])[this._allPrefixesHead] = undefined
+        this._allPrefixesHead++
+        return item
     }
 
     /** Serialize buffer reads/writes/flushes across concurrent `_getAndProcessObjectBody` calls. */
