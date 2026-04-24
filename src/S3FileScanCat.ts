@@ -59,6 +59,8 @@ export class S3FileScanCat {
     private _isClosed: boolean = false
     private _s3ObjectBodyProcessInProgressLimit: number
     private _maxFileSizeBytes: number
+    /** Passed to every `waitUntil` in this class so stuck predicates cannot spin forever. */
+    private _waitUntilTimeoutMs: number
     private _scannerOptions: ScannerOptions
     private _awsAccess: AWSSecrets
     private _s3Client: S3Client
@@ -98,6 +100,10 @@ export class S3FileScanCat {
             scannerOptions.limits?.maxFileSizeBytes !== undefined
                 ? scannerOptions.limits?.maxFileSizeBytes
                 : 128 * 1024 * 1024
+        this._waitUntilTimeoutMs =
+            scannerOptions.limits?.waitUntilTimeoutMs !== undefined
+                ? scannerOptions.limits.waitUntilTimeoutMs
+                : 30 * 60 * 1000
         this._scannerOptions = scannerOptions
         this._awsAccess = awsAccess
         // Build the keep-alive agents as named references so `close()` can destroy them later.
@@ -344,21 +350,24 @@ export class S3FileScanCat {
         let waits = 0
         try {
             while (this._keyParamsRemaining() > 0 || this._scanPrefixForPartitionsProcessCount > 0) {
-                await waitUntil(() => {
-                    if (this._fatalScanError) {
-                        return true
-                    }
-                    if (
-                        this._scanPrefixForPartitionsProcessCount === 0 ||
-                        (this._keyParamsRemaining() > 0 &&
-                            this._scanPrefixForPartitionsProcessCount <
-                                this._scannerOptions.limits.scanPrefixForPartitionsProcessLimit)
-                    ) {
-                        return true
-                    } else if (waits++ % 20 === 0) {
-                        void this._logger?.debug(`Waiting on ListObjects to complete prefix=${srcPrefix} `)
-                    }
-                })
+                await waitUntil(
+                    () => {
+                        if (this._fatalScanError) {
+                            return true
+                        }
+                        if (
+                            this._scanPrefixForPartitionsProcessCount === 0 ||
+                            (this._keyParamsRemaining() > 0 &&
+                                this._scanPrefixForPartitionsProcessCount <
+                                    this._scannerOptions.limits.scanPrefixForPartitionsProcessLimit)
+                        ) {
+                            return true
+                        } else if (waits++ % 20 === 0) {
+                            void this._logger?.debug(`Waiting on ListObjects to complete prefix=${srcPrefix} `)
+                        }
+                    },
+                    { timeout: this._waitUntilTimeoutMs }
+                )
                 if (this._fatalScanError) {
                     break
                 }
@@ -496,25 +505,28 @@ export class S3FileScanCat {
                                 )
                                 continue
                             }
-                            await waitUntil(() => {
-                                if (this._fatalScanError) {
-                                    return true
-                                }
-                                // Per-call backpressure: only this invocation's body workers
-                                // count against the limit, so parallel concatFilesAtPrefix
-                                // calls (if ever introduced) get their own concurrency budget
-                                // instead of starving each other through a shared counter.
-                                if (
-                                    concatState.bodiesInFlight <
-                                    this._s3ObjectBodyProcessInProgressLimit
-                                ) {
-                                    return true
-                                } else if (waits++ % 20 === 0) {
-                                    void this._logger?.trace(
-                                        `Waiting on ListObjects to complete prefix=${srcPrefix} `
-                                    )
-                                }
-                            })
+                            await waitUntil(
+                                () => {
+                                    if (this._fatalScanError) {
+                                        return true
+                                    }
+                                    // Per-call backpressure: only this invocation's body workers
+                                    // count against the limit, so parallel concatFilesAtPrefix
+                                    // calls (if ever introduced) get their own concurrency budget
+                                    // instead of starving each other through a shared counter.
+                                    if (
+                                        concatState.bodiesInFlight <
+                                        this._s3ObjectBodyProcessInProgressLimit
+                                    ) {
+                                        return true
+                                    } else if (waits++ % 20 === 0) {
+                                        void this._logger?.trace(
+                                            `Waiting on ListObjects to complete prefix=${srcPrefix} `
+                                        )
+                                    }
+                                },
+                                { timeout: this._waitUntilTimeoutMs }
+                            )
                             if (this._fatalScanError) {
                                 break
                             }

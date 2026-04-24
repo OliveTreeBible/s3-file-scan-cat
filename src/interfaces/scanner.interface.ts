@@ -26,6 +26,12 @@ export interface ScannerLimits {
     scanPrefixForPartitionsProcessLimit: number
     s3ObjectBodyProcessInProgressLimit: number
     maxFileSizeBytes: number
+    /**
+     * Max time (ms) inner `waitUntil` loops may wait before throwing `waitUntil timed out`.
+     * Prevents hangs if backpressure counters never clear (misconfiguration or bugs).
+     * Default 30 minutes. Use `Number.POSITIVE_INFINITY` to restore prior unbounded behavior.
+     */
+    waitUntilTimeoutMs?: number
 }
 
 export interface AWSConfig {

@@ -95,6 +95,27 @@ describe('S3FileScanCat edges (mocked S3)', () => {
         )
     })
 
+    it('throws when inner waitUntil exceeds limits.waitUntilTimeoutMs (stuck body backpressure)', async () => {
+        stubPartitionAndConcatList(() => ({
+            Contents: [{ Key: 'data/src/year=2020/a.json', Size: 8 }],
+            IsTruncated: false,
+        }))
+        const cat = new S3FileScanCat(
+            false,
+            scannerOptions({
+                partitionStack: ['year'],
+                limits: {
+                    s3ObjectBodyProcessInProgressLimit: 0,
+                    waitUntilTimeoutMs: 120,
+                },
+            }),
+            testAwsSecrets
+        )
+        await expect(cat.scanAndProcessFiles('bucket', 'data/src', 'data/dst')).rejects.toThrow(
+            'waitUntil timed out'
+        )
+    })
+
     it('paginates concat ListObjectsV2 using ContinuationToken', async () => {
         let concatCalls = 0
         stubPartitionAndConcatList((input) => {
