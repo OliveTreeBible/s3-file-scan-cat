@@ -1008,12 +1008,16 @@ export class S3FileScanCat {
                 if (this._fatalScanError) {
                     return
                 }
+                // Always advance pagination from IsTruncated / NextContinuationToken, even when this
+                // page has no CommonPrefixes. S3 can return truncated pages with only Contents (objects
+                // directly under the prefix) or an empty page; nesting token updates under
+                // `if (CommonPrefixes)` caused premature loop exit and dropped subsequent prefix pages.
+                if (response.IsTruncated === true && response.NextContinuationToken !== undefined) {
+                    continuationToken = response.NextContinuationToken
+                } else {
+                    continuationToken = undefined
+                }
                 if (response.CommonPrefixes && response.CommonPrefixes.length > 0) {
-                    if (response.IsTruncated && response.NextContinuationToken) {
-                        continuationToken = response.NextContinuationToken
-                    } else {
-                        continuationToken = undefined
-                    }
                     response.CommonPrefixes.forEach((commonPrefix) => {
                         const prefixEval = this._evaluatePrefix(keyParams, commonPrefix, curPart)
                         if (prefixEval.partition) {
@@ -1024,8 +1028,10 @@ export class S3FileScanCat {
                             throw new Error(`Unexpected partition info encountered. ${JSON.stringify(keyParams)}`)
                         }
                     })
-                } else {
-                    throw new Error(`Unexpected empty response from S3. ${JSON.stringify(keyParams)}`)
+                } else if (response.Contents && response.Contents.length > 0) {
+                    void this._logger?.warn(
+                        `ListObjectsV2 with Delimiter returned no CommonPrefixes but ${response.Contents.length} key(s) under prefix=${keyParams.curPrefix} (curPart=${curPart}); partition scan only follows sub-prefixes, so these objects are skipped.`
+                    )
                 }
             } while (continuationToken)
         } finally {

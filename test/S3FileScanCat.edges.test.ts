@@ -6,6 +6,7 @@ import { sdkStreamMixin } from '@smithy/util-stream'
 import { mockClient } from 'aws-sdk-client-mock'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
+import { EmptyPrefixError } from '../src/errors/EmptyPrefixError.js'
 import type { ConcatState } from '../src/interfaces/scanner.interface.js'
 import { S3FileScanCat } from '../src/S3FileScanCat.js'
 import { scannerOptions, testAwsSecrets } from './testDefaults.js'
@@ -33,6 +34,65 @@ function stubPartitionAndConcatList(
 describe('S3FileScanCat edges (mocked S3)', () => {
     beforeEach(() => {
         s3Mock.reset()
+    })
+
+    it('paginates partition ListObjectsV2 when a truncated page returns no CommonPrefixes', async () => {
+        let partitionCalls = 0
+        s3Mock.on(ListObjectsV2Command).callsFake((input) => {
+            if (input.Delimiter === '/') {
+                partitionCalls++
+                if (!input.ContinuationToken) {
+                    return Promise.resolve({
+                        IsTruncated: true,
+                        NextContinuationToken: 'tok-partition-empty',
+                        Contents: [{ Key: 'data/src/_SUCCESS', Size: 1 }],
+                    })
+                }
+                return Promise.resolve({
+                    CommonPrefixes: [{ Prefix: 'data/src/year=2020/' }],
+                    IsTruncated: false,
+                })
+            }
+            return Promise.resolve({
+                Contents: [{ Key: 'data/src/year=2020/one.json', Size: 8 }],
+                IsTruncated: false,
+            })
+        })
+        s3Mock.on(GetObjectCommand).callsFake(() =>
+            Promise.resolve({
+                Body: sdkStreamMixin(Readable.from(['{"k":1}'])),
+            })
+        )
+        s3Mock.on(PutObjectCommand).resolves({})
+
+        const cat = new S3FileScanCat(false, scannerOptions({ partitionStack: ['year'] }), testAwsSecrets)
+        await cat.scanAndProcessFiles('bucket', 'data/src', 'data/dst')
+
+        expect(partitionCalls).toBe(2)
+        const partitionInputs = s3Mock
+            .commandCalls(ListObjectsV2Command)
+            .filter((c) => c.args[0].input.Delimiter === '/')
+            .map((c) => c.args[0].input)
+        expect(partitionInputs[1].ContinuationToken).toBe('tok-partition-empty')
+        expect(cat.prefixesProcessedTotal).toBe(1)
+        expect(cat.s3ObjectsPutTotal).toBe(1)
+    })
+
+    it('does not throw on partition scan when only Contents exist under the prefix (skips objects)', async () => {
+        s3Mock.on(ListObjectsV2Command).callsFake((input) => {
+            if (input.Delimiter === '/') {
+                return Promise.resolve({
+                    Contents: [{ Key: 'data/src/orphan.json', Size: 5 }],
+                    IsTruncated: false,
+                })
+            }
+            return Promise.resolve({ Contents: [], IsTruncated: false })
+        })
+
+        const cat = new S3FileScanCat(false, scannerOptions({ partitionStack: ['year'] }), testAwsSecrets)
+        await expect(cat.scanAndProcessFiles('bucket', 'data/src', 'data/dst')).rejects.toThrow(
+            EmptyPrefixError
+        )
     })
 
     it('paginates concat ListObjectsV2 using ContinuationToken', async () => {
