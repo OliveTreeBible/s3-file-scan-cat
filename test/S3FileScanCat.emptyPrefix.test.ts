@@ -1,11 +1,10 @@
 import { describe, expect, it } from 'vitest'
 
-import { EmptyPrefixError } from '../src/errors/EmptyPrefixError.js'
 import { S3FileScanCat } from '../src/S3FileScanCat.js'
 import { scannerOptions, testAwsSecrets } from './testDefaults.js'
 
 describe('S3FileScanCat.scanAndProcessFiles (empty prefixes)', () => {
-    it('throws EmptyPrefixError when bounds end is before start (no S3 calls)', async () => {
+    it('throws RangeError when bounds end is before start (no S3 calls)', async () => {
         const cat = new S3FileScanCat(
             false,
             scannerOptions({
@@ -15,7 +14,11 @@ describe('S3FileScanCat.scanAndProcessFiles (empty prefixes)', () => {
             testAwsSecrets
         )
 
-        await expect(cat.scanAndProcessFiles('bucket', 'data/src', 'data/dst')).rejects.toThrow(EmptyPrefixError)
+        await expect(cat.scanAndProcessFiles('bucket', 'data/src', 'data/dst')).rejects.toSatisfy(
+            (err: unknown) =>
+                err instanceof RangeError &&
+                /bounds\.startDate must be on or before bounds\.endDate/.test((err as Error).message)
+        )
     })
 
     it('rejects bounds with a partitionStack that does not start with year/month/day', async () => {

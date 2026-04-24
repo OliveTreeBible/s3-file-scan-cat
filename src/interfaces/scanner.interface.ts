@@ -9,7 +9,9 @@ export interface ScannerConfig {
 }
 
 export interface ScannerBounds {
+    /** Inclusive UTC calendar day (`YYYY-MM-DD`). Must be ≤ `endDate`. */
     startDate: string
+    /** Inclusive UTC calendar day (`YYYY-MM-DD`). Must be ≥ `startDate`. */
     endDate: string
 }
 

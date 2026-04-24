@@ -307,6 +307,11 @@ export class S3FileScanCat {
             const remainingStack = stack.slice(expectedDateParts.length)
             const startMs = utcDayStartMs(this._scannerOptions.bounds.startDate)
             const endMs = utcDayStartMs(this._scannerOptions.bounds.endDate)
+            if (startMs > endMs) {
+                throw new RangeError(
+                    `bounds.startDate must be on or before bounds.endDate (UTC); received startDate=${this._scannerOptions.bounds.startDate} endDate=${this._scannerOptions.bounds.endDate}`
+                )
+            }
             for (let t = startMs; t <= endMs; t += MS_PER_DAY) {
                 const { year, month, day } = formatUtcYmdParts(t)
                 const datePrefix = `${normalizedSrcRoot}year=${year}/month=${month}/day=${day}`
