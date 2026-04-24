@@ -1023,10 +1023,11 @@ export class S3FileScanCat {
      *
      * @param name Field name (for error messages).
      * @param raw Caller-supplied value (may be `undefined` to select the default).
-     * @param defaultValue Value to use when `raw === undefined`. Assumed to be already valid.
-     * @param allowInfinity Whether `Number.POSITIVE_INFINITY` is an accepted value. Use `true`
-     *   for "unbounded" caps that the caller opts into explicitly; `false` for counts that must
-     *   correspond to a discrete number of workers.
+     * @param options Validation configuration.
+     * @param options.defaultValue Value to use when `raw === undefined`. Assumed to be already valid.
+     * @param options.allowInfinity Whether `Number.POSITIVE_INFINITY` is an accepted value. Use
+     *   `true` for "unbounded" caps that the caller opts into explicitly; `false` for counts that
+     *   must correspond to a discrete number of workers.
      */
     private static _validateConcurrencyLimit(
         name: string,
@@ -1351,9 +1352,9 @@ export class S3FileScanCat {
 
         // Acquire a PutObject slot (class-level cap). The atomic check-and-bump inside the
         // predicate means two racing flush promises cannot both observe the gate as open. With
-        // the default `Infinity` limit the predicate succeeds on the very first call, so this
-        // reduces to a single microtask yield. A fatal error observed mid-wait short-circuits
-        // without bumping, and we abandon the PUT below.
+        // the default `Infinity` limit the predicate succeeds on the first evaluation, so
+        // `waitUntil` never awaits its poll timer (`setTimeout` between checks). A fatal error
+        // observed mid-wait short-circuits without bumping, and we abandon the PUT below.
         let putSlotAcquired = false
         let putWaits = 0
         await waitUntil(
