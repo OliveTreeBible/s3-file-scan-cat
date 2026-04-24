@@ -1917,4 +1917,75 @@ describe('S3FileScanCat edges (mocked S3)', () => {
                 )
         ).toThrow(/s3ObjectPutProcessLimit/)
     })
+
+    it('rejects fractional concurrency limits at construction (cap could otherwise be exceeded)', () => {
+        // Every gate compares `count < limit` and then bumps by 1. A fractional limit like 1.5
+        // would let 2 workers through (1 < 1.5), which violates the cap. Require integers.
+        expect(
+            () =>
+                new S3FileScanCat(
+                    false,
+                    scannerOptions({
+                        partitionStack: ['year'],
+                        limits: { concatFilesAtPrefixProcessLimit: 1.5 },
+                    }),
+                    testAwsSecrets
+                )
+        ).toThrow(/concatFilesAtPrefixProcessLimit/)
+
+        expect(
+            () =>
+                new S3FileScanCat(
+                    false,
+                    scannerOptions({
+                        partitionStack: ['year'],
+                        limits: { concatFilesAtPrefixProcessLimit: Number.POSITIVE_INFINITY },
+                    }),
+                    testAwsSecrets
+                )
+        ).toThrow(/concatFilesAtPrefixProcessLimit/)
+
+        expect(
+            () =>
+                new S3FileScanCat(
+                    false,
+                    scannerOptions({
+                        partitionStack: ['year'],
+                        limits: {
+                            s3ObjectBodyProcessInProgressLimit: 2,
+                            s3ObjectBodyProcessTotalLimit: 2.5,
+                        },
+                    }),
+                    testAwsSecrets
+                )
+        ).toThrow(/s3ObjectBodyProcessTotalLimit/)
+
+        expect(
+            () =>
+                new S3FileScanCat(
+                    false,
+                    scannerOptions({
+                        partitionStack: ['year'],
+                        limits: { s3ObjectPutProcessLimit: 3.25 },
+                    }),
+                    testAwsSecrets
+                )
+        ).toThrow(/s3ObjectPutProcessLimit/)
+
+        // Infinity is allowed for the two caps that default to Infinity.
+        expect(
+            () =>
+                new S3FileScanCat(
+                    false,
+                    scannerOptions({
+                        partitionStack: ['year'],
+                        limits: {
+                            s3ObjectBodyProcessTotalLimit: Number.POSITIVE_INFINITY,
+                            s3ObjectPutProcessLimit: Number.POSITIVE_INFINITY,
+                        },
+                    }),
+                    testAwsSecrets
+                )
+        ).not.toThrow()
+    })
 })

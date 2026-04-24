@@ -128,43 +128,55 @@ export class S3FileScanCat {
                 ? scannerOptions.limits?.s3ObjectBodyProcessInProgressLimit
                 : 100
         // New concurrency limits (phase-2 parallelism). Validation happens here so that bad
-        // config fails fast at construction instead of deep inside the scan.
+        // config fails fast at construction instead of deep inside the scan. Fractional values
+        // are rejected because every gate compares `count < limit` and then bumps the counter
+        // by exactly 1 — a limit of 1.5 would allow 2 concurrent workers (since 1 < 1.5) and
+        // silently violate the cap.
         this._concatFilesAtPrefixProcessLimit =
             scannerOptions.limits?.concatFilesAtPrefixProcessLimit !== undefined
                 ? scannerOptions.limits.concatFilesAtPrefixProcessLimit
                 : 1
         if (
-            !Number.isFinite(this._concatFilesAtPrefixProcessLimit) ||
+            !Number.isInteger(this._concatFilesAtPrefixProcessLimit) ||
             this._concatFilesAtPrefixProcessLimit < 1
         ) {
             throw new RangeError(
-                `scannerOptions.limits.concatFilesAtPrefixProcessLimit must be a finite integer >= 1; received ${scannerOptions.limits?.concatFilesAtPrefixProcessLimit}`
+                `scannerOptions.limits.concatFilesAtPrefixProcessLimit must be an integer >= 1; received ${scannerOptions.limits?.concatFilesAtPrefixProcessLimit}`
             )
         }
         // Default to Infinity (opt-in) so existing callers — including any who drive
         // `concatFilesAtPrefix` directly across calls — see no change. When explicitly set,
-        // the value must be >= the per-leaf limit so a single leaf cannot deadlock on itself
-        // (the inner `waitUntil` gates on both caps).
+        // the value must be a positive integer (same rationale as above) and >= the per-leaf
+        // limit so a single leaf cannot deadlock on itself (the inner `waitUntil` gates on
+        // both caps).
         this._s3ObjectBodyProcessTotalLimit =
             scannerOptions.limits?.s3ObjectBodyProcessTotalLimit !== undefined
                 ? scannerOptions.limits.s3ObjectBodyProcessTotalLimit
                 : Number.POSITIVE_INFINITY
-        if (
-            scannerOptions.limits?.s3ObjectBodyProcessTotalLimit !== undefined &&
-            this._s3ObjectBodyProcessTotalLimit < this._s3ObjectBodyProcessInProgressLimit
-        ) {
-            throw new RangeError(
-                `scannerOptions.limits.s3ObjectBodyProcessTotalLimit (${this._s3ObjectBodyProcessTotalLimit}) must be >= s3ObjectBodyProcessInProgressLimit (${this._s3ObjectBodyProcessInProgressLimit}).`
-            )
+        if (scannerOptions.limits?.s3ObjectBodyProcessTotalLimit !== undefined) {
+            const v = this._s3ObjectBodyProcessTotalLimit
+            if (v !== Number.POSITIVE_INFINITY && (!Number.isInteger(v) || v < 1)) {
+                throw new RangeError(
+                    `scannerOptions.limits.s3ObjectBodyProcessTotalLimit must be a positive integer or Infinity; received ${v}`
+                )
+            }
+            if (v < this._s3ObjectBodyProcessInProgressLimit) {
+                throw new RangeError(
+                    `scannerOptions.limits.s3ObjectBodyProcessTotalLimit (${v}) must be >= s3ObjectBodyProcessInProgressLimit (${this._s3ObjectBodyProcessInProgressLimit}).`
+                )
+            }
         }
         this._s3ObjectPutProcessLimit =
             scannerOptions.limits?.s3ObjectPutProcessLimit !== undefined
                 ? scannerOptions.limits.s3ObjectPutProcessLimit
                 : Number.POSITIVE_INFINITY
-        if (this._s3ObjectPutProcessLimit < 1) {
-            throw new RangeError(
-                `scannerOptions.limits.s3ObjectPutProcessLimit must be >= 1; received ${scannerOptions.limits?.s3ObjectPutProcessLimit}`
-            )
+        if (scannerOptions.limits?.s3ObjectPutProcessLimit !== undefined) {
+            const v = this._s3ObjectPutProcessLimit
+            if (v !== Number.POSITIVE_INFINITY && (!Number.isInteger(v) || v < 1)) {
+                throw new RangeError(
+                    `scannerOptions.limits.s3ObjectPutProcessLimit must be a positive integer or Infinity; received ${v}`
+                )
+            }
         }
         this._maxFileSizeBytes =
             scannerOptions.limits?.maxFileSizeBytes !== undefined
