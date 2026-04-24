@@ -664,7 +664,8 @@ describe('S3FileScanCat edges (mocked S3)', () => {
         ])
     })
 
-    it('throws on invalid list content entry without Key', async () => {
+    it('throws on invalid list content entry without Key, regardless of Size', async () => {
+        // Size=5 but no Key -> this is the unambiguous data-integrity case.
         stubPartitionAndConcatList(() => ({
             Contents: [{ Size: 5 }],
             IsTruncated: false,
@@ -672,8 +673,75 @@ describe('S3FileScanCat edges (mocked S3)', () => {
 
         const cat = new S3FileScanCat(false, scannerOptions({ partitionStack: ['year'] }), testAwsSecrets)
         await expect(cat.scanAndProcessFiles('bucket', 'data/src', 'data/dst')).rejects.toThrow(
-            'Invalid S3 Object encountered.'
+            /Invalid S3 Object encountered \(missing Key\)/
         )
+    })
+
+    it('throws on invalid list content entry with zero Size AND missing Key (the misclassification case)', async () => {
+        // Size=0 AND no Key -> previously this silently hit the zero-size warn branch (logging
+        // `undefined`). It is a malformed entry and must error.
+        stubPartitionAndConcatList(() => ({
+            Contents: [{ Size: 0 }],
+            IsTruncated: false,
+        }))
+
+        const cat = new S3FileScanCat(false, scannerOptions({ partitionStack: ['year'] }), testAwsSecrets)
+        await expect(cat.scanAndProcessFiles('bucket', 'data/src', 'data/dst')).rejects.toThrow(
+            /Invalid S3 Object encountered \(missing Key\)/
+        )
+    })
+
+    it('warns and skips entries where Size is undefined but Key is present (not a hard error)', async () => {
+        // A valid Key with Size undefined is the scenario that previously threw
+        // "Invalid S3 Object encountered." despite nothing actually being invalid.
+        stubPartitionAndConcatList(() => ({
+            Contents: [
+                { Key: 'data/src/year=2020/sizeless.json' }, // Size undefined -> warn & skip
+                { Key: 'data/src/year=2020/good.json', Size: 8 },
+            ],
+            IsTruncated: false,
+        }))
+        s3Mock.on(GetObjectCommand).callsFake((input) => {
+            // The "sizeless" entry must never be fetched.
+            if (input.Key?.includes('sizeless')) {
+                throw new Error('sizeless.json should have been skipped without fetching')
+            }
+            return Promise.resolve({ Body: sdkStreamMixin(Readable.from(['{"ok":true}'])) })
+        })
+        s3Mock.on(PutObjectCommand).resolves({})
+
+        const cat = new S3FileScanCat(
+            false,
+            scannerOptions({
+                partitionStack: ['year'],
+                // Instantiate a logger so the skip warning has somewhere to land.
+                loggerOptions: { level: 'warn' },
+            }),
+            testAwsSecrets
+        )
+        const logger = (cat as unknown as { _logger?: { warn: (...args: unknown[]) => unknown } })._logger
+        if (!logger) {
+            throw new Error('expected a logger to have been constructed for this test')
+        }
+        const warnSpy = vi.fn()
+        logger.warn = warnSpy
+
+        await cat.scanAndProcessFiles('bucket', 'data/src', 'data/dst')
+
+        // Only the "good" object should have been fetched and written.
+        expect(cat.s3ObjectsFetchedTotal).toBe(1)
+        expect(cat.s3ObjectsPutTotal).toBe(1)
+        // And the skip must have been announced on the warn channel with the offending key.
+        expect(
+            warnSpy.mock.calls.some((args) => {
+                const msg = String(args[0])
+                return (
+                    msg.includes('no fetchable content') &&
+                    msg.includes('sizeless.json') &&
+                    msg.includes('Size=undefined')
+                )
+            })
+        ).toBe(true)
     })
 
     it('drains in-flight partition scans before rejecting so background work cannot mutate state', async () => {

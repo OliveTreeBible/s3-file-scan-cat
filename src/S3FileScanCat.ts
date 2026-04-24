@@ -469,62 +469,71 @@ export class S3FileScanCat {
                     }
                     if (response.Contents) {
                         for (const s3Object of response.Contents) {
-                            if (s3Object.Size && s3Object.Key) {
-                                await waitUntil(() => {
-                                    if (this._fatalScanError) {
-                                        return true
-                                    }
-                                    // Per-call backpressure: only this invocation's body workers
-                                    // count against the limit, so parallel concatFilesAtPrefix
-                                    // calls (if ever introduced) get their own concurrency budget
-                                    // instead of starving each other through a shared counter.
-                                    if (
-                                        concatState.bodiesInFlight <
-                                        this._s3ObjectBodyProcessInProgressLimit
-                                    ) {
-                                        return true
-                                    } else if (waits++ % 20 === 0) {
-                                        void this._logger?.trace(
-                                            `Waiting on ListObjects to complete prefix=${srcPrefix} `
-                                        )
-                                    }
-                                })
-                                if (this._fatalScanError) {
-                                    break
-                                }
-                                // Assign the listing-order sequence BEFORE spawning so that even
-                                // if workers finish out of order the append path can reassemble
-                                // them in S3's lexicographic/chronological order.
-                                const seq = nextSeq++
-                                // We purposely do not await on this - the waitUntil above limits the number of these
-                                // calls that are in progress at any given moment. The promise is tracked in
-                                // `inFlightBodies` so the finally block can await it before returning.
-                                const bodyPromise: Promise<void> = this._getAndProcessObjectBody(
-                                    bucket,
-                                    s3Object.Key,
-                                    concatState,
-                                    prefix,
-                                    srcPrefix,
-                                    destPrefix,
-                                    seq
+                            // Classify the listing entry. Key is the only hard requirement:
+                            // without it there's nothing to fetch and no way to build the
+                            // destination path, which is an unambiguous data-integrity problem.
+                            // Size can legitimately be absent in some SDK/mock responses, so we
+                            // treat undefined the same as 0 (warn + skip) instead of erroring.
+                            if (s3Object.Key === undefined || s3Object.Key === '') {
+                                throw new Error(
+                                    `Invalid S3 Object encountered (missing Key): ${JSON.stringify(s3Object)}`
                                 )
-                                    .catch((err: unknown) => {
-                                        void this._logger?.error(
-                                            `getObject/process failed for key=${s3Object.Key}: ${err instanceof Error ? err.message : String(err)}`
-                                        )
-                                        this._setFatalScanError(err)
-                                    })
-                                    .finally(() => {
-                                        inFlightBodies.delete(bodyPromise)
-                                    })
-                                inFlightBodies.add(bodyPromise)
-                            } else if (s3Object.Size === 0) {
-                                void this._logger?.warn(
-                                    `S3 Object had zero size ${JSON.stringify(s3Object.Key)}`
-                                )
-                            } else {
-                                throw new Error('Invalid S3 Object encountered.')
                             }
+                            if (s3Object.Size === undefined || s3Object.Size === 0) {
+                                void this._logger?.warn(
+                                    `S3 Object had no fetchable content (Size=${s3Object.Size}) key=${s3Object.Key}; skipping.`
+                                )
+                                continue
+                            }
+                            await waitUntil(() => {
+                                if (this._fatalScanError) {
+                                    return true
+                                }
+                                // Per-call backpressure: only this invocation's body workers
+                                // count against the limit, so parallel concatFilesAtPrefix
+                                // calls (if ever introduced) get their own concurrency budget
+                                // instead of starving each other through a shared counter.
+                                if (
+                                    concatState.bodiesInFlight <
+                                    this._s3ObjectBodyProcessInProgressLimit
+                                ) {
+                                    return true
+                                } else if (waits++ % 20 === 0) {
+                                    void this._logger?.trace(
+                                        `Waiting on ListObjects to complete prefix=${srcPrefix} `
+                                    )
+                                }
+                            })
+                            if (this._fatalScanError) {
+                                break
+                            }
+                            // Assign the listing-order sequence BEFORE spawning so that even
+                            // if workers finish out of order the append path can reassemble
+                            // them in S3's lexicographic/chronological order.
+                            const seq = nextSeq++
+                            // We purposely do not await on this - the waitUntil above limits the number of these
+                            // calls that are in progress at any given moment. The promise is tracked in
+                            // `inFlightBodies` so the finally block can await it before returning.
+                            const objectKey = s3Object.Key
+                            const bodyPromise: Promise<void> = this._getAndProcessObjectBody(
+                                bucket,
+                                objectKey,
+                                concatState,
+                                prefix,
+                                srcPrefix,
+                                destPrefix,
+                                seq
+                            )
+                                .catch((err: unknown) => {
+                                    void this._logger?.error(
+                                        `getObject/process failed for key=${objectKey}: ${err instanceof Error ? err.message : String(err)}`
+                                    )
+                                    this._setFatalScanError(err)
+                                })
+                                .finally(() => {
+                                    inFlightBodies.delete(bodyPromise)
+                                })
+                            inFlightBodies.add(bodyPromise)
                         }
                     } else {
                         void this._logger?.warn(`Prefix had no contents: ${prefix}`)
