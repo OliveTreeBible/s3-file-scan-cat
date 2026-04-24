@@ -44,7 +44,9 @@ export class S3FileScanCat {
     private _prefixesProcessedTotal: number = 0
     /** Leaves whose concat pass wrote at least one output part (`_s3ObjectsPutTotal` rose for that leaf). */
     private _prefixesWithEmittedOutputTotal: number = 0
+    /** Incremented after `GetObject` + `transformToString()` completes (per source key read). */
     private _s3ObjectsFetchedTotal: number = 0
+    /** Incremented only after each successful `PutObject` (output part). */
     private _s3ObjectsPutTotal: number = 0
     private _isDone: boolean = false
     /** Set on first background failure so wait loops can exit and the scan rejects cleanly. */
@@ -251,10 +253,15 @@ export class S3FileScanCat {
         return this._prefixesWithEmittedOutputTotal
     }
 
+    /**
+     * Source objects fully read via GetObject this run (after `transformToString()`). See
+     * `S3FileScanCatStats.s3ObjectsFetchedTotal` for nuance vs. listing skips and empty bodies.
+     */
     get s3ObjectsFetchedTotal(): number {
         return this._s3ObjectsFetchedTotal
     }
 
+    /** Successful output `PutObject` count this run. See `S3FileScanCatStats.s3ObjectsPutTotal`. */
     get s3ObjectsPutTotal(): number {
         return this._s3ObjectsPutTotal
     }
@@ -267,6 +274,9 @@ export class S3FileScanCat {
      * Returns a frozen, atomic snapshot of all scanner metrics. Prefer this over calling the
      * individual getters when sampling progress in a monitoring loop: all fields are read in
      * the same tick, so internal counters cannot drift between reads.
+     *
+     * `s3ObjectsFetchedTotal` counts completed GetObject reads; `s3ObjectsPutTotal` counts
+     * successful PutObject uploads — they are not paired 1:1 (see `S3FileScanCatStats`).
      */
     getStats(): Readonly<S3FileScanCatStats> {
         return Object.freeze({

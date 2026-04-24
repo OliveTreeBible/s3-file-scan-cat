@@ -145,9 +145,18 @@ export interface S3FileScanCatStats {
     s3ObjectBodyWorkersInProgress: number
     /** PutObject calls currently in flight. */
     s3ObjectPutWorkersInProgress: number
-    /** Total S3 objects successfully fetched in the current run. */
+    /**
+     * Count of source objects whose `GetObject` body was fully read into memory (`transformToString`
+     * completed) this run. Includes reads whose payload was empty (list/get mismatch); does **not**
+     * include keys skipped at list time (e.g. zero size, over `maxSourceObjectSizeBytes`) or keys
+     * never fetched due to a fatal error before read.
+     */
     s3ObjectsFetchedTotal: number
-    /** Total S3 objects successfully put (output parts written) in the current run. */
+    /**
+     * Count of successful `PutObject` calls (output `.json.gz` parts written) this run. Incremented
+     * only after S3 accepts the upload — not the same notion as `s3ObjectsFetchedTotal` (one leaf
+     * can yield many puts or none).
+     */
     s3ObjectsPutTotal: number
     /** True while `scanAndProcessFiles` is executing on this instance. */
     isRunning: boolean
