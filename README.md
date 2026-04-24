@@ -97,13 +97,15 @@ s3Scanner
         scannerConfig.aws.s3.scannerPrefix,
         scannerConfig.aws.s3.destinationPrefix
     )
-    .then(() => {
-        process.exit(0)
-    })
     .catch((error) => {
         console.error(`Failed: ${error}`)
-        process.exit(1)
+        process.exitCode = 1
+    })
+    .finally(() => {
+        s3Scanner.close()
     })
 ```
+
+v2 uses explicit keep-alive HTTP(S) agents; `close()` destroys the S3 client and those agents after the scan promise settles (do not call `close()` while `scanAndProcessFiles` is still running). Use `.finally` as above, or `try` / `finally` with `await`, so long-running scripts and tests can shut down cleanly without depending on `process.exit()` to drop open sockets.
 
 For environment-driven logging, you can build options with `createLoggerFromEnv` from `ot-logger-deluxe` and pass the relevant fields into `loggerOptions`, or rely on env vars as documented in that package.
