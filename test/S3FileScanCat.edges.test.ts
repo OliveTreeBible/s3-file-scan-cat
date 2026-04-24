@@ -1988,4 +1988,86 @@ describe('S3FileScanCat edges (mocked S3)', () => {
                 )
         ).not.toThrow()
     })
+
+    it('rejects NaN and non-number concurrency limits (gates would never open otherwise)', () => {
+        // NaN would make every `count < NaN` comparison false, so the predicate never returns
+        // true and `waitUntil` spins until the timeout. Surface it at construction instead.
+        expect(
+            () =>
+                new S3FileScanCat(
+                    false,
+                    scannerOptions({
+                        partitionStack: ['year'],
+                        limits: { concatFilesAtPrefixProcessLimit: Number.NaN },
+                    }),
+                    testAwsSecrets
+                )
+        ).toThrow(/concatFilesAtPrefixProcessLimit/)
+
+        expect(
+            () =>
+                new S3FileScanCat(
+                    false,
+                    scannerOptions({
+                        partitionStack: ['year'],
+                        limits: { s3ObjectBodyProcessTotalLimit: Number.NaN },
+                    }),
+                    testAwsSecrets
+                )
+        ).toThrow(/s3ObjectBodyProcessTotalLimit/)
+
+        expect(
+            () =>
+                new S3FileScanCat(
+                    false,
+                    scannerOptions({
+                        partitionStack: ['year'],
+                        limits: { s3ObjectPutProcessLimit: Number.NaN },
+                    }),
+                    testAwsSecrets
+                )
+        ).toThrow(/s3ObjectPutProcessLimit/)
+
+        // Non-number runtime values (bypassing TS) must also be rejected.
+        expect(
+            () =>
+                new S3FileScanCat(
+                    false,
+                    scannerOptions({
+                        partitionStack: ['year'],
+                        limits: {
+                            s3ObjectPutProcessLimit: '10' as unknown as number,
+                        },
+                    }),
+                    testAwsSecrets
+                )
+        ).toThrow(/s3ObjectPutProcessLimit/)
+
+        expect(
+            () =>
+                new S3FileScanCat(
+                    false,
+                    scannerOptions({
+                        partitionStack: ['year'],
+                        limits: {
+                            concatFilesAtPrefixProcessLimit: null as unknown as number,
+                        },
+                    }),
+                    testAwsSecrets
+                )
+        ).toThrow(/concatFilesAtPrefixProcessLimit/)
+
+        // Negative Infinity is a number but not a legitimate limit.
+        expect(
+            () =>
+                new S3FileScanCat(
+                    false,
+                    scannerOptions({
+                        partitionStack: ['year'],
+                        limits: { s3ObjectPutProcessLimit: Number.NEGATIVE_INFINITY },
+                    }),
+                    testAwsSecrets
+                )
+        ).toThrow(/s3ObjectPutProcessLimit/)
+    })
 })

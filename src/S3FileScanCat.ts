@@ -127,57 +127,39 @@ export class S3FileScanCat {
             scannerOptions.limits?.s3ObjectBodyProcessInProgressLimit !== undefined
                 ? scannerOptions.limits?.s3ObjectBodyProcessInProgressLimit
                 : 100
-        // New concurrency limits (phase-2 parallelism). Validation happens here so that bad
-        // config fails fast at construction instead of deep inside the scan. Fractional values
-        // are rejected because every gate compares `count < limit` and then bumps the counter
-        // by exactly 1 — a limit of 1.5 would allow 2 concurrent workers (since 1 < 1.5) and
-        // silently violate the cap.
-        this._concatFilesAtPrefixProcessLimit =
-            scannerOptions.limits?.concatFilesAtPrefixProcessLimit !== undefined
-                ? scannerOptions.limits.concatFilesAtPrefixProcessLimit
-                : 1
-        if (
-            !Number.isInteger(this._concatFilesAtPrefixProcessLimit) ||
-            this._concatFilesAtPrefixProcessLimit < 1
-        ) {
-            throw new RangeError(
-                `scannerOptions.limits.concatFilesAtPrefixProcessLimit must be an integer >= 1; received ${scannerOptions.limits?.concatFilesAtPrefixProcessLimit}`
-            )
-        }
-        // Default to Infinity (opt-in) so existing callers — including any who drive
+        // New concurrency limits (phase-2 parallelism). Validation happens here so bad config
+        // fails fast at construction instead of deep inside the scan. Every gate compares
+        // `count < limit` and bumps the counter by exactly 1, so the limit MUST be an
+        // integer: a limit of 1.5 would allow 2 workers (1 < 1.5) and silently violate the cap,
+        // and a limit of NaN would make every comparison false — producing an indefinite
+        // `waitUntil` spin that only breaks at `waitUntilTimeoutMs`.
+        this._concatFilesAtPrefixProcessLimit = S3FileScanCat._validateConcurrencyLimit(
+            'concatFilesAtPrefixProcessLimit',
+            scannerOptions.limits?.concatFilesAtPrefixProcessLimit,
+            { defaultValue: 1, allowInfinity: false }
+        )
+        // Default Infinity (opt-in) so existing callers — including any who drive
         // `concatFilesAtPrefix` directly across calls — see no change. When explicitly set,
         // the value must be a positive integer (same rationale as above) and >= the per-leaf
-        // limit so a single leaf cannot deadlock on itself (the inner `waitUntil` gates on
-        // both caps).
-        this._s3ObjectBodyProcessTotalLimit =
-            scannerOptions.limits?.s3ObjectBodyProcessTotalLimit !== undefined
-                ? scannerOptions.limits.s3ObjectBodyProcessTotalLimit
-                : Number.POSITIVE_INFINITY
-        if (scannerOptions.limits?.s3ObjectBodyProcessTotalLimit !== undefined) {
-            const v = this._s3ObjectBodyProcessTotalLimit
-            if (v !== Number.POSITIVE_INFINITY && (!Number.isInteger(v) || v < 1)) {
-                throw new RangeError(
-                    `scannerOptions.limits.s3ObjectBodyProcessTotalLimit must be a positive integer or Infinity; received ${v}`
-                )
-            }
-            if (v < this._s3ObjectBodyProcessInProgressLimit) {
-                throw new RangeError(
-                    `scannerOptions.limits.s3ObjectBodyProcessTotalLimit (${v}) must be >= s3ObjectBodyProcessInProgressLimit (${this._s3ObjectBodyProcessInProgressLimit}).`
-                )
-            }
+        // limit so a single leaf cannot deadlock on itself (the inner gate checks both caps).
+        this._s3ObjectBodyProcessTotalLimit = S3FileScanCat._validateConcurrencyLimit(
+            's3ObjectBodyProcessTotalLimit',
+            scannerOptions.limits?.s3ObjectBodyProcessTotalLimit,
+            { defaultValue: Number.POSITIVE_INFINITY, allowInfinity: true }
+        )
+        if (
+            scannerOptions.limits?.s3ObjectBodyProcessTotalLimit !== undefined &&
+            this._s3ObjectBodyProcessTotalLimit < this._s3ObjectBodyProcessInProgressLimit
+        ) {
+            throw new RangeError(
+                `scannerOptions.limits.s3ObjectBodyProcessTotalLimit (${this._s3ObjectBodyProcessTotalLimit}) must be >= s3ObjectBodyProcessInProgressLimit (${this._s3ObjectBodyProcessInProgressLimit}).`
+            )
         }
-        this._s3ObjectPutProcessLimit =
-            scannerOptions.limits?.s3ObjectPutProcessLimit !== undefined
-                ? scannerOptions.limits.s3ObjectPutProcessLimit
-                : Number.POSITIVE_INFINITY
-        if (scannerOptions.limits?.s3ObjectPutProcessLimit !== undefined) {
-            const v = this._s3ObjectPutProcessLimit
-            if (v !== Number.POSITIVE_INFINITY && (!Number.isInteger(v) || v < 1)) {
-                throw new RangeError(
-                    `scannerOptions.limits.s3ObjectPutProcessLimit must be a positive integer or Infinity; received ${v}`
-                )
-            }
-        }
+        this._s3ObjectPutProcessLimit = S3FileScanCat._validateConcurrencyLimit(
+            's3ObjectPutProcessLimit',
+            scannerOptions.limits?.s3ObjectPutProcessLimit,
+            { defaultValue: Number.POSITIVE_INFINITY, allowInfinity: true }
+        )
         this._maxFileSizeBytes =
             scannerOptions.limits?.maxFileSizeBytes !== undefined
                 ? scannerOptions.limits?.maxFileSizeBytes
@@ -1031,6 +1013,51 @@ export class S3FileScanCat {
             return
         }
         this._fatalScanError = err instanceof Error ? err : new Error(String(err))
+    }
+
+    /**
+     * Validate a concurrency-limit option. Concurrency gates are implemented as `count < limit`
+     * followed by `count++`, so the limit must be an integer (fractional values would allow
+     * overshoot) and must be a real number (NaN would make every comparison false, causing
+     * `waitUntil` to spin until the configured timeout).
+     *
+     * @param name Field name (for error messages).
+     * @param raw Caller-supplied value (may be `undefined` to select the default).
+     * @param defaultValue Value to use when `raw === undefined`. Assumed to be already valid.
+     * @param allowInfinity Whether `Number.POSITIVE_INFINITY` is an accepted value. Use `true`
+     *   for "unbounded" caps that the caller opts into explicitly; `false` for counts that must
+     *   correspond to a discrete number of workers.
+     */
+    private static _validateConcurrencyLimit(
+        name: string,
+        raw: number | undefined,
+        options: { defaultValue: number; allowInfinity: boolean }
+    ): number {
+        if (raw === undefined) {
+            return options.defaultValue
+        }
+        if (typeof raw !== 'number' || Number.isNaN(raw)) {
+            throw new RangeError(
+                `scannerOptions.limits.${name} must be a number; received ${raw === null ? 'null' : typeof raw}${Number.isNaN(raw as number) ? ' (NaN)' : ''}.`
+            )
+        }
+        if (raw === Number.POSITIVE_INFINITY) {
+            if (!options.allowInfinity) {
+                throw new RangeError(
+                    `scannerOptions.limits.${name} must be a finite integer >= 1; Infinity is not allowed.`
+                )
+            }
+            return raw
+        }
+        if (!Number.isInteger(raw) || raw < 1) {
+            const allowedSuffix = options.allowInfinity
+                ? ' or Infinity'
+                : ''
+            throw new RangeError(
+                `scannerOptions.limits.${name} must be an integer >= 1${allowedSuffix}; received ${raw}.`
+            )
+        }
+        return raw
     }
 
     /**
