@@ -289,6 +289,8 @@ export class S3FileScanCat {
             `BEGIN scanConcatenateCopy srcPrefix=${srcPrefix}:destPrefix=${destPrefix}:partitionStack=${this._scannerOptions.partitionStack}`
         )
         const destPath = destPrefix
+        /** Canonical scan root for path math and `PrefixParams.prefix` (always ends with `/`). */
+        const normalizedSrcRoot = srcPrefix.endsWith('/') ? srcPrefix : `${srcPrefix}/`
         if (this._scannerOptions.bounds?.startDate && this._scannerOptions.bounds.endDate) {
             const stack = this._scannerOptions.partitionStack
             const expectedDateParts = ['year', 'month', 'day'] as const
@@ -303,12 +305,11 @@ export class S3FileScanCat {
                 )
             }
             const remainingStack = stack.slice(expectedDateParts.length)
-            const normalizedSrc = srcPrefix.endsWith('/') ? srcPrefix : `${srcPrefix}/`
             const startMs = utcDayStartMs(this._scannerOptions.bounds.startDate)
             const endMs = utcDayStartMs(this._scannerOptions.bounds.endDate)
             for (let t = startMs; t <= endMs; t += MS_PER_DAY) {
                 const { year, month, day } = formatUtcYmdParts(t)
-                const datePrefix = `${normalizedSrc}year=${year}/month=${month}/day=${day}`
+                const datePrefix = `${normalizedSrcRoot}year=${year}/month=${month}/day=${day}`
                 if (remainingStack.length === 0) {
                     // Day is already the leaf partition; skip further scanning and
                     // feed the prefix straight into the concat phase.
@@ -316,7 +317,8 @@ export class S3FileScanCat {
                 } else {
                     this._keyParams.push({
                         bucket,
-                        prefix: srcPrefix,
+                        // Same normalized root used to build `curPrefix` / date paths (see #3).
+                        prefix: normalizedSrcRoot,
                         curPrefix: datePrefix,
                         // Fresh copy per iteration because _scanPrefixForPartitions mutates via shift().
                         partitionStack: remainingStack.slice(),
@@ -326,8 +328,8 @@ export class S3FileScanCat {
         } else {
             this._keyParams.push({
                 bucket,
-                prefix: srcPrefix,
-                curPrefix: srcPrefix /* This changes as we traverse down the path, srcPrefix is where we start */,
+                prefix: normalizedSrcRoot,
+                curPrefix: normalizedSrcRoot,
                 // Clone the stack because _scanPrefixForPartitions mutates it via shift();
                 // without this, re-running on the same instance would see an empty stack.
                 partitionStack: this._scannerOptions.partitionStack.slice(),

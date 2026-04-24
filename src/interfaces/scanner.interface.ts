@@ -39,6 +39,7 @@ export interface AWSS3Config {
 
 export interface PrefixParams {
     bucket: string
+    /** Scan root, normalized with a trailing `/` (same convention as `curPrefix` path building). */
     prefix: string
     curPrefix: string
     partitionStack: string[]
