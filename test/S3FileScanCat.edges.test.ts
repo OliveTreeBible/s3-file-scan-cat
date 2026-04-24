@@ -75,6 +75,7 @@ describe('S3FileScanCat edges (mocked S3)', () => {
             .map((c) => c.args[0].input)
         expect(partitionInputs[1].ContinuationToken).toBe('tok-partition-empty')
         expect(cat.prefixesProcessedTotal).toBe(1)
+        expect(cat.prefixesWithEmittedOutputTotal).toBe(1)
         expect(cat.s3ObjectsPutTotal).toBe(1)
     })
 
@@ -339,6 +340,7 @@ describe('S3FileScanCat edges (mocked S3)', () => {
 
         // Correctness: every prefix was processed exactly once.
         expect(cat.prefixesProcessedTotal).toBe(NUM_PREFIXES)
+        expect(cat.prefixesWithEmittedOutputTotal).toBe(NUM_PREFIXES)
         expect(cat.totalPrefixesToProcess).toBe(NUM_PREFIXES)
         expect(cat.s3ObjectsPutTotal).toBe(NUM_PREFIXES)
 
@@ -372,6 +374,7 @@ describe('S3FileScanCat edges (mocked S3)', () => {
         expect(before.concatListObjectsInProgress).toBe(0)
         expect(before.totalPrefixesToProcess).toBe(0)
         expect(before.prefixesProcessedTotal).toBe(0)
+        expect(before.prefixesWithEmittedOutputTotal).toBe(0)
         expect(before.prefixesRemainingInQueue).toBe(0)
         expect(before.s3ObjectBodyWorkersInProgress).toBe(0)
         expect(before.s3ObjectPutWorkersInProgress).toBe(0)
@@ -393,6 +396,7 @@ describe('S3FileScanCat edges (mocked S3)', () => {
         const after = cat.getStats()
         expect(after.totalPrefixesToProcess).toBe(1)
         expect(after.prefixesProcessedTotal).toBe(1)
+        expect(after.prefixesWithEmittedOutputTotal).toBe(1)
         expect(after.prefixesRemainingInQueue).toBe(0)
         expect(after.s3ObjectsFetchedTotal).toBe(1)
         expect(after.s3ObjectsPutTotal).toBe(1)
@@ -471,6 +475,7 @@ describe('S3FileScanCat edges (mocked S3)', () => {
         await cat.scanAndProcessFiles('bucket', 'data/src', 'data/dst')
 
         expect(cat.prefixesProcessedTotal).toBe(1)
+        expect(cat.prefixesWithEmittedOutputTotal).toBe(1)
         expect(
             warnSpy.mock.calls.some((args) =>
                 String(args[0]).includes('Skipping CommonPrefix') && String(args[0]).includes('yearly=1')
@@ -851,6 +856,7 @@ describe('S3FileScanCat edges (mocked S3)', () => {
 
         expect(cat.isDone).toBe(true)
         expect(cat.prefixesProcessedTotal).toBe(2)
+        expect(cat.prefixesWithEmittedOutputTotal).toBe(2)
         expect(concatListInputs.map((c) => c.Prefix).sort()).toEqual([
             'data/src/year=2020/month=01/day=01/',
             'data/src/year=2020/month=01/day=02/',
@@ -1136,6 +1142,7 @@ describe('S3FileScanCat edges (mocked S3)', () => {
         expect(cat.s3ObjectsPutTotal).toBe(1)
         expect(cat.s3ObjectsFetchedTotal).toBe(1)
         expect(cat.prefixesProcessedTotal).toBe(1)
+        expect(cat.prefixesWithEmittedOutputTotal).toBe(1)
         expect(cat.totalPrefixesToProcess).toBe(1)
 
         // Second run against the same instance should zero the per-run counters before starting,
@@ -1145,6 +1152,7 @@ describe('S3FileScanCat edges (mocked S3)', () => {
         expect(cat.s3ObjectsPutTotal).toBe(1)
         expect(cat.s3ObjectsFetchedTotal).toBe(1)
         expect(cat.prefixesProcessedTotal).toBe(1)
+        expect(cat.prefixesWithEmittedOutputTotal).toBe(1)
         expect(cat.totalPrefixesToProcess).toBe(1)
     })
 
@@ -1187,8 +1195,22 @@ describe('S3FileScanCat edges (mocked S3)', () => {
 
         expect(cat.isDone).toBe(true)
         expect(cat.prefixesProcessedTotal).toBe(1)
+        expect(cat.prefixesWithEmittedOutputTotal).toBe(1)
         expect(cat.totalPrefixesToProcess).toBe(1)
         expect(cat.s3ObjectsPutTotal).toBe(1)
+    })
+
+    it('prefixesWithEmittedOutputTotal stays 0 when a leaf finishes concat with no PutObject (all Size=0)', async () => {
+        stubPartitionAndConcatList(() => ({
+            Contents: [{ Key: 'data/src/year=2020/zero.json', Size: 0 }],
+            IsTruncated: false,
+        }))
+        const cat = new S3FileScanCat(false, scannerOptions({ partitionStack: ['year'] }), testAwsSecrets)
+        await cat.scanAndProcessFiles('bucket', 'data/src', 'data/dst')
+        expect(cat.prefixesProcessedTotal).toBe(1)
+        expect(cat.prefixesWithEmittedOutputTotal).toBe(0)
+        expect(cat.s3ObjectsPutTotal).toBe(0)
+        expect(s3Mock.commandCalls(GetObjectCommand).length).toBe(0)
     })
 
     it('does not emit double newlines when source bodies already end with a newline', async () => {

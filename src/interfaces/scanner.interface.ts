@@ -125,8 +125,13 @@ export interface S3FileScanCatStats {
     concatListObjectsInProgress: number
     /** Leaf prefixes enqueued for the concat phase when the current run entered phase 2. */
     totalPrefixesToProcess: number
-    /** Leaf prefixes processed so far in the current run. */
+    /**
+     * Leaf prefixes whose `concatFilesAtPrefix` pass has **finished** this run (success path),
+     * including leaves that listed only empty/skip keys and wrote **no** output objects.
+     */
     prefixesProcessedTotal: number
+    /** Leaf prefixes for which at least one output object (`PutObject`) was written this run. */
+    prefixesWithEmittedOutputTotal: number
     /** Leaf prefixes still queued, waiting to enter `concatFilesAtPrefix`. */
     prefixesRemainingInQueue: number
     /** GetObject body workers currently in flight; aggregate rollup across all concatFilesAtPrefix calls. */

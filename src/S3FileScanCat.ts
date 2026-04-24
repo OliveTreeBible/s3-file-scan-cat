@@ -42,6 +42,8 @@ export class S3FileScanCat {
     private _s3ObjectBodyProcessInProgress: number = 0
     private _s3ObjectPutProcessCount: number = 0
     private _prefixesProcessedTotal: number = 0
+    /** Leaves whose concat pass wrote at least one output part (`_s3ObjectsPutTotal` rose for that leaf). */
+    private _prefixesWithEmittedOutputTotal: number = 0
     private _s3ObjectsFetchedTotal: number = 0
     private _s3ObjectsPutTotal: number = 0
     private _isDone: boolean = false
@@ -230,6 +232,11 @@ export class S3FileScanCat {
         return this._prefixesProcessedTotal
     }
 
+    /** Leaves that produced at least one `PutObject` this run (never greater than `prefixesProcessedTotal`). */
+    get prefixesWithEmittedOutputTotal(): number {
+        return this._prefixesWithEmittedOutputTotal
+    }
+
     get s3ObjectsFetchedTotal(): number {
         return this._s3ObjectsFetchedTotal
     }
@@ -253,6 +260,7 @@ export class S3FileScanCat {
             concatListObjectsInProgress: this._s3PrefixListObjectsProcessCount,
             totalPrefixesToProcess: this._totalPrefixesToProcess,
             prefixesProcessedTotal: this._prefixesProcessedTotal,
+            prefixesWithEmittedOutputTotal: this._prefixesWithEmittedOutputTotal,
             prefixesRemainingInQueue: this._allPrefixesRemaining(),
             s3ObjectBodyWorkersInProgress: this._s3ObjectBodyProcessInProgress,
             s3ObjectPutWorkersInProgress: this._s3ObjectPutProcessCount,
@@ -413,7 +421,8 @@ export class S3FileScanCat {
         }
 
         // The sequential `await this.concatFilesAtPrefix(...)` loop above guarantees every
-        // prefix has already incremented `_prefixesProcessedTotal` before we arrive here, so
+        // leaf has finished concat (`_prefixesProcessedTotal`), and `_prefixesWithEmittedOutputTotal`
+        // has been updated for leaves that wrote at least one part, before we arrive here, so
         // there is nothing left to wait for. A previous `waitUntil(... === ...)` at this
         // spot was dead code *and* ignored `_fatalScanError`, which would have been a real
         // hazard if the loop was ever parallelized. Removing it rather than "fixing" it
@@ -425,6 +434,7 @@ export class S3FileScanCat {
 
     async concatFilesAtPrefix(bucket: string, prefix: string, srcPrefix: string, destPrefix: string): Promise<void> {
         void this._logger?.trace(`BEGIN _concatFilesAtPrefix prefix=${prefix}`)
+        const putsBeforeLeaf = this._s3ObjectsPutTotal
         let waits = 0
         const concatState: ConcatState = {
             buffer: undefined,
@@ -609,6 +619,9 @@ export class S3FileScanCat {
             `END _concatFilesAtPrefix prefix=${prefix} - _s3PrefixListObjectsProcessCount: ${this._s3PrefixListObjectsProcessCount}`
         )
         this._prefixesProcessedTotal++
+        if (this._s3ObjectsPutTotal > putsBeforeLeaf) {
+            this._prefixesWithEmittedOutputTotal++
+        }
     }
 
     async _getAndProcessObjectBody(
@@ -802,6 +815,7 @@ export class S3FileScanCat {
         this._s3ObjectBodyProcessInProgress = 0
         this._s3ObjectPutProcessCount = 0
         this._prefixesProcessedTotal = 0
+        this._prefixesWithEmittedOutputTotal = 0
         this._s3ObjectsFetchedTotal = 0
         this._s3ObjectsPutTotal = 0
         this._isDone = false

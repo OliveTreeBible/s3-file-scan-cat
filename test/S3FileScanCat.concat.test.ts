@@ -49,6 +49,7 @@ describe('S3FileScanCat.concat (mocked S3)', () => {
         expect(cat.isDone).toBe(true)
         expect(cat.s3ObjectsPutTotal).toBe(1)
         expect(cat.prefixesProcessedTotal).toBe(1)
+        expect(cat.prefixesWithEmittedOutputTotal).toBe(1)
 
         const putCalls = s3Mock.commandCalls(PutObjectCommand)
         expect(putCalls.length).toBe(1)
