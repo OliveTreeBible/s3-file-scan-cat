@@ -42,7 +42,6 @@ export interface PrefixParams {
     prefix: string
     curPrefix: string
     partitionStack: string[]
-    bounds: ScannerBounds | undefined
 }
 
 export interface ConcatState {

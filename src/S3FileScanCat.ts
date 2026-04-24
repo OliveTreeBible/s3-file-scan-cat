@@ -27,7 +27,8 @@ const MAX_LIST_KEYS = 1000
 
 export class S3FileScanCat {
     private _logger?: Logger
-    private _delimiter: string = '/'
+    /** S3 path separator. Immutable; constant across the lifetime of the instance. */
+    private readonly _delimiter: string = '/'
     // Queues are implemented as arrays with a monotonic read-index pointer so that taking an item
     // is O(1) instead of Array.shift()'s O(n). Without this, draining thousands of leaf prefixes
     // is O(n^2). The arrays are cleared in `_resetRunState` to release references.
@@ -319,7 +320,6 @@ export class S3FileScanCat {
                         curPrefix: datePrefix,
                         // Fresh copy per iteration because _scanPrefixForPartitions mutates via shift().
                         partitionStack: remainingStack.slice(),
-                        bounds: this._scannerOptions.bounds,
                     })
                 }
             }
@@ -331,7 +331,6 @@ export class S3FileScanCat {
                 // Clone the stack because _scanPrefixForPartitions mutates it via shift();
                 // without this, re-running on the same instance would see an empty stack.
                 partitionStack: this._scannerOptions.partitionStack.slice(),
-                bounds: this._scannerOptions.bounds,
             })
         }
 
@@ -1050,7 +1049,6 @@ export class S3FileScanCat {
                             prefix: keyParams.prefix,
                             curPrefix: nextPart,
                             partitionStack: partitionStackClone,
-                            bounds: keyParams.bounds,
                         }
                     } else {
                         result.partition = nextPart
