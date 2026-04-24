@@ -635,6 +635,36 @@ describe('S3FileScanCat edges (mocked S3)', () => {
         )
     })
 
+    it('close() throws while scanAndProcessFiles is running and does not mark the instance closed', async () => {
+        stubPartitionAndConcatList(() => ({
+            Contents: [{ Key: 'data/src/year=2020/a.json', Size: 8 }],
+            IsTruncated: false,
+        }))
+        let releaseGet: (() => void) | undefined
+        s3Mock.on(GetObjectCommand).callsFake(
+            () =>
+                new Promise((resolve) => {
+                    releaseGet = () =>
+                        resolve({ Body: sdkStreamMixin(Readable.from(['{"x":1}'])) })
+                })
+        )
+        s3Mock.on(PutObjectCommand).resolves({})
+
+        const cat = new S3FileScanCat(false, scannerOptions({ partitionStack: ['year'] }), testAwsSecrets)
+        const scan = cat.scanAndProcessFiles('bucket', 'data/src', 'data/dst')
+        await new Promise((r) => setTimeout(r, 25))
+
+        expect(() => cat.close()).toThrow(/await the scan promise first/)
+        expect(cat.isClosed).toBe(false)
+
+        releaseGet?.()
+        await scan
+        expect(cat.isClosed).toBe(false)
+
+        cat.close()
+        expect(cat.isClosed).toBe(true)
+    })
+
     it("defaults the S3 client region to 'us-east-1' for backward compatibility", async () => {
         const cat = new S3FileScanCat(false, scannerOptions({ partitionStack: ['year'] }), testAwsSecrets)
         const client = (cat as unknown as { _s3Client: S3Client })._s3Client

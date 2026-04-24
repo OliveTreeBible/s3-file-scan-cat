@@ -151,12 +151,20 @@ export class S3FileScanCat {
      * sockets (because `keepAlive: true` pins them until their idle timer fires). Always call
      * `close()` when the caller is done using the scanner.
      *
-     * Idempotent: safe to call multiple times. Does not wait for in-flight operations; the
-     * caller should `await` any outstanding `scanAndProcessFiles` promises first.
+     * Throws if `scanAndProcessFiles` is still running so the client is not torn down under
+     * active work — await the scan promise first.
+     *
+     * Idempotent: safe to call multiple times after a successful close. Does not wait for
+     * in-flight S3 calls other than the scan guard above.
      */
     close(): void {
         if (this._isClosed) {
             return
+        }
+        if (this._isRunning) {
+            throw new Error(
+                'S3FileScanCat.close() cannot run while scanAndProcessFiles is in progress; await the scan promise first.'
+            )
         }
         this._isClosed = true
         try {
